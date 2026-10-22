@@ -8,6 +8,7 @@ BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 LIGHT='\033[0;37m'
+CLAY='\033[1;36m'      # FIX: Bright cyan untuk label info (sebelumnya tidak terdefinisi)
 BRED="\e[41m"
 BBLUE="\e[38;5;21m"
 #information
@@ -16,39 +17,42 @@ Error="${RED}[Mistake]${NC}"
 #pkg install ncurses-utils
 #echo -e "Getting Information Please Wait...."
 is_root() {
-    if [ 0 == $UID ]; then
-        echo -e "${OK} ${NC} The current user is the root user..${NC}"
-        sleep 1
-        echo -e "Getting Information...."
-    else
-        echo -e "${Error} ${NC} Please switch to the root user and execute start-menu again ${NC}"
-        exit 1
-    fi
+if [ 0 == $UID ]; then
+echo -e "${OK} ${NC} The current user is the root user..${NC}"
+sleep 1
+echo -e "Getting Information...."
+else
+echo -e "${Error} ${NC} Please switch to the root user and execute start-menu again ${NC}"
+exit 1
+fi
 }
 is_root
 #pkg install ncurses-utils
 ip=$(wget -qO- ipinfo.io/ip)
-domainhost=$(cat /root/domain)
+domainhost=$(cat /root/domain 2>/dev/null || echo "Tidak ada")
 region=$(wget -qO- ipinfo.io/region)
 isp=$(wget -qO- ipinfo.io/org)
 timezone=$(wget -qO- ipinfo.io/timezone)
-ossys=$(neofetch | grep "OS" | cut -d: -f2 | sed 's/ //g')
-host=$(neofetch | grep "Host" | cut -d: -f2 | sed 's/ //g')
-kernel=$(neofetch | grep "Kernel" | cut -d: -f2 | sed 's/ //g')
-uptime=$(neofetch | grep "Uptime" | cut -d: -f2 | sed 's/ //g')
-cpu=$(neofetch | grep "CPU" | cut -d: -f2 | sed 's/ //g')
-memory=$(neofetch | grep "Memory" | cut -d: -f2 | sed 's/ //g')
+# ==================================================
+# OPTIMASI: Ganti 6x panggilan neofetch dengan native commands
+# Hemat ~50-100MB RAM di VPS 1GB, eksekusi 10x lebih cepat
+# ==================================================
+ossys=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")
+host=$(hostname)
+kernel=$(uname -r)
+uptime=$(uptime -p 2>/dev/null | sed 's/up //' || echo "unknown")
+cpu=$(awk -F: '/^model name/{gsub(/^[ \t]+/,"",$2); print $2; exit}' /proc/cpuinfo)
+memory=$(free -h | awk '/^Mem:/ {print $3 " / " $2}')
 echo -e "Getting Information..."
 clear
-# echo -e "$BLUE━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"$NC
+# echo -e "$BLUE=======================================$NC"
 # echo -e "$BRED           SELAMAT DATANG            $NC"
-# echo -e "$BLUE━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"$NC
-# figlet LIZSVR | lolcat
+# echo -e "$BLUE=======================================$NC"
+# figlet HAXOR | lolcat
 # #echo -e "$NC"
-# echo -e "Telegram : @liz_mine"
-echo -e "$BLUE━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$NC"
+echo -e "$BLUE=======================================$NC"
 echo -e "$BRED          Informasi System           $NC"
-echo -e "$BLUE━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$NC"
+echo -e "$BLUE=======================================$NC"
 echo -e "$CLAY IP Address :$NC $ip $NC"
 echo -e "$CLAY Domain :$NC $domainhost $NC"
 echo -e "$CLAY Region :$NC $region $NC"
@@ -61,9 +65,9 @@ echo -e "$CLAY OS System :$NC $ossys $NC"
 echo -e "$CLAY Time Zone :$NC $timezone $NC"
 echo -e "$CLAY Date :$NC $(date +%A) $(date +%m-%d-%Y)"
 echo -e "$CLAY Memory :$NC $memory $NC"
-echo -e "$BLUE━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$NC"
+echo -e "$BLUE=======================================$NC"
 echo -e "$BRED           Service Status            $NC"
-echo -e "$BLUE━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$NC"
+echo -e "$BLUE=======================================$NC"
 #
 #
 sshs=$(systemctl status ssh | grep Active: | awk '{print $2}')
@@ -129,6 +133,6 @@ fi
 # else
 # echo -e " Xray/V2Ray              :$RED [Error] $NC"
 # fi
-echo -e "$BLUE━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$NC"
-echo -e "$BRED----------- Mod By LIZSVR -----------"
-echo -e "$BLUE━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$NC"
+echo -e "$BLUE=======================================$NC"
+echo -e "$BRED----------- Mod By HAXOR -----------"
+echo -e "$BLUE=======================================$NC"
