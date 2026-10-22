@@ -1,5 +1,5 @@
 #!/bin/bash
-# ==========================================
+# =========================================
 # Color
 RED='\033[0;31m'
 NC='\033[0m'
@@ -9,33 +9,24 @@ BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 LIGHT='\033[0;37m'
-# ==========================================
-#information
-OK = "$ {
-  Green
-}[OK]$ {
-  Font
-}"
-Error = "$ {
-  Red
-}[Mistake]$ {
-  Font
-}"
+# =========================================
+# information
+OK="${GREEN}[OK]${NC}"
+Error="${RED}[Mistake]${NC}"
 clear
-echo -e "$BLUE╔═══════════════════════════════════════$BLUE╗"
-echo -e "$BLUE║           $ORANGE  [ Main Menu ]          $BLUE   ║"
-echo -e "$BLUE╠═══════════════════════════════════════$BLUE╣"
+echo -e "$BLUE╔=======================================$BLUE╗"
+echo -e "$BLUE║             $ORANGE[ Main Menu ]$BLUE             ║"
+echo -e "$BLUE╠=======================================$BLUE╣"
 echo -e "$BLUE║---------------------------------------║"
-echo -e "$BLUE╠➣$NC 1$NC. SSH & OpenVPN Account             $BLUE║ "
-echo -e "$BLUE╠➣$NC 2$NC. Restart All Service         $BLUE      ║ " 
-echo -e "$BLUE╠➣$NC 3$NC. Backup & Restore            $BLUE      ║ " 
-echo -e "$BLUE╠➣$NC 4$NC. Settings                    $BLUE      ║ " 
-echo -e "$BLUE╠➣$NC 5$NC. Cek Service                 $BLUE      ║ " 
-echo -e "$BLUE╠➣$NC 6$NC. Exit                        $BLUE      ║ " 
+echo -e "$BLUE╠➣$NC 1. SSH & OpenVPN Account             $BLUE║"
+echo -e "$BLUE╠➣$NC 2. Restart All Service               $BLUE║"
+echo -e "$BLUE╠➣$NC 3. Backup & Restore                  $BLUE║"
+echo -e "$BLUE╠➣$NC 4. Settings                          $BLUE║"
+echo -e "$BLUE╠➣$NC 5. Cek Service                       $BLUE║"
+echo -e "$BLUE╠➣$NC 6. Exit                              $BLUE║"
 echo -e "$BLUE║---------------------------------------║"
-echo -e "$BLUE╠➣$NC Mod By LIZSVR                        $BLUE║"
-echo -e "$BLUE╠➣$NC Telegram https://t.me/liz_mine       $BLUE║"
-echo -e "$BLUE╚═══════════════════════════════════════╝$NC"  
+echo -e "$BLUE╠➣$NC Mod By HAXOR                         $BLUE║"
+echo -e "$BLUE╚=======================================$BLUE╝$NC"
 read -p "Select From Options [ 1 - 6 ] : " menu
 echo -e ""
 case $menu in
@@ -54,7 +45,7 @@ msetting
 5)
 start-menu
 ;;
-5)
+6)
 clear
 exit
 ;;
