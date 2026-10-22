@@ -191,7 +191,16 @@ screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7900 --max-clients 500
 sed -i 's/Port 22/Port 22/g' /etc/ssh/sshd_config
 
 # install dropbear
-apt -y install dropbear
+# install dropbear (retry 2x, exit on failure)
+if ! apt -y install dropbear; then
+  sleep 3
+  apt update -y
+  if ! apt -y install dropbear; then
+    echo "ERROR: Gagal install dropbear setelah retry 2x"
+    echo "Cek koneksi internet / DNS / repository apt"
+    exit 1
+  fi
+fi
 sed -i 's/NO_START=1/NO_START=0/g' /etc/default/dropbear
 sed -i 's/DROPBEAR_PORT=22/DROPBEAR_PORT=143/g' /etc/default/dropbear
 sed -i 's/DROPBEAR_EXTRA_ARGS=/DROPBEAR_EXTRA_ARGS="-p 109"/g' /etc/default/dropbear
