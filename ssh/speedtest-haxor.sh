@@ -26,19 +26,21 @@
 # ============================================================
 
 # ---------- Palette 256-color modern HAXOR ----------
-CYAN='\033[38;5;51m'      # Bright cyan - primary
-TEAL='\033[38;5;38m'      # Teal - secondary
-GREEN='\033[38;5;48m'     # Mint green - status OK
-YELLOW='\033[38;5;227m'   # Soft yellow - menu numbers
-ORANGE='\033[38;5;215m'   # Soft orange - warning
-RED='\033[38;5;203m'      # Soft red - error
-PINK='\033[38;5;213m'     # Soft pink - accent
-WHITE='\033[38;5;255m'    # Off-white - text normal
-GRAY='\033[38;5;245m'     # Light gray - subtle
-DGRAY='\033[38;5;240m'    # Dark gray - border
-NC='\033[0m'              # Reset
-BG_CYAN='\e[48;5;30m'     # Dark cyan bg - header box
-BG_TEAL='\e[48;5;23m'     # Dark teal bg - secondary
+# Pakai ANSI-C quoting $'...' supaya byte ESC tersimpan langsung di variabel,
+# sehingga warna tampil benar di echo, echo -e, read -p, dan printf.
+CYAN=$'\033[38;5;51m'      # Bright cyan - primary
+TEAL=$'\033[38;5;38m'      # Teal - secondary
+GREEN=$'\033[38;5;48m'     # Mint green - status OK
+YELLOW=$'\033[38;5;227m'   # Soft yellow - menu numbers
+ORANGE=$'\033[38;5;215m'   # Soft orange - warning
+RED=$'\033[38;5;203m'      # Soft red - error
+PINK=$'\033[38;5;213m'     # Soft pink - accent
+WHITE=$'\033[38;5;255m'    # Off-white - text normal
+GRAY=$'\033[38;5;245m'     # Light gray - subtle
+DGRAY=$'\033[38;5;240m'    # Dark gray - border
+NC=$'\033[0m'              # Reset
+BG_CYAN=$'\033[48;5;30m'   # Dark cyan bg - header box
+BG_TEAL=$'\033[48;5;23m'   # Dark teal bg - secondary
 
 # ---------- Function: show_menu (re-entrant) ----------
 show_menu() {
