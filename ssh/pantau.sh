@@ -63,44 +63,66 @@ pause() {
 # ==========================================
 # Function get_active_connections()
 # Ambil daftar koneksi SSH/Dropbear aktif
-# Format output: PID|USER|PEER_IP|LOCAL_PORT|SERVICE
+# Format output: PID|PEER_IP|LOCAL_PORT|SERVICE
+#
+# FIX1 (v12-Sesi-2.3): Rewrite pure bash + regex, BUKAN awk.
+# Alasan: awk match() 3-arg (gawk extension) TIDAK support di mawk
+# (Ubuntu default). Field position awk juga rentan off-by-one
+# kalau ss output punya format berbeda (State column, dsb).
+# Pure bash + regex robust terhadap semua variasi.
 # ==========================================
 get_active_connections() {
-    # Build port filter untuk ss
-    # SSH (22) + Dropbear (109, 143)
-    ss -tnp state established 2>/dev/null | \
-        awk -v ssh_port="$SSH_PORT" -v db_ports="$DROPBEAR_PORTS" '
-        BEGIN {
-            # Build array of monitored ports
-            split(ssh_port, ssh_arr, " ")
-            for (i in ssh_arr) ports[ssh_arr[i]] = "SSH"
-            split(db_ports, db_arr, " ")
-            for (i in db_arr) ports[db_arr[i]] = "Dropbear"
-        }
-        NR > 1 {
-            # Field 4 = Local Address:Port, Field 5 = Peer Address:Port
-            local_full = $4
-            peer_full  = $5
-            # Extract local port (after last colon)
-            n = split(local_full, parts, ":")
-            local_port = parts[n]
-            # Extract peer IP (before last colon)
-            m = split(peer_full, pparts, ":")
-            peer_ip = pparts[1]
-            for (k = 2; k < m; k++) peer_ip = peer_ip ":" pparts[k]
-            # Check if local port is monitored
-            if (local_port in ports) {
-                service = ports[local_port]
-                # Extract PID from "users:((\"proc\",PID,fd))"
-                pid_str = $6
-                if (match(pid_str, /pid=([0-9]+)/, arr)) {
-                    pid = arr[1]
-                } else {
-                    pid = "?"
+    # -H = no header line (skip NR>1 logic)
+    # state established = filter TCP established only
+    ss -tnpH state established 2>/dev/null | while IFS= read -r line; do
+        [ -z "$line" ] && continue
+
+        # Extract PID via bash regex (BASH_REMATCH)
+        local pid="?"
+        if [[ $line =~ pid=([0-9]+) ]]; then
+            pid="${BASH_REMATCH[1]}"
+        fi
+
+        # Extract all tokens containing ':' but NOT starting with 'users:' or 'pid='
+        # Tokens valid: '203.194.112.128:22' (IPv4), '[::ffff:203.194.112.128]:22' (IPv6)
+        # Tokens invalid: 'users:((', 'pid=12345'
+        local addr_list
+        addr_list=$(printf '%s\n' "$line" | awk '{
+            for (i=1; i<=NF; i++) {
+                if ($i ~ /:/ && $i !~ /^users:/ && $i !~ /^pid=/) {
+                    print $i
                 }
-                printf "%s|%s|%s|%s\n", pid, peer_ip, local_port, service
             }
-        }'
+        }')
+
+        local local_addr peer_addr
+        local_addr=$(printf '%s\n' "$addr_list" | sed -n '1p')
+        peer_addr=$(printf '%s\n' "$addr_list" | sed -n '2p')
+
+        [ -z "$local_addr" ] || [ -z "$peer_addr" ] && continue
+
+        # Extract local port (segment after last colon)
+        local local_port="${local_addr##*:}"
+        # Strip trailing junk (just in case)
+        local_port="${local_port%%[^0-9]*}"
+
+        # Extract peer IP (everything before last colon)
+        local peer_ip="${peer_addr%:*}"
+        # Strip IPv6 brackets if any
+        peer_ip="${peer_ip#[}"
+        peer_ip="${peer_ip%]}"
+
+        # Determine service based on local port
+        local service=""
+        case "$local_port" in
+            "$SSH_PORT") service="SSH" ;;
+            109|143)    service="Dropbear" ;;
+        esac
+
+        if [ -n "$service" ] && [ -n "$peer_ip" ]; then
+            printf '%s|%s|%s|%s\n' "$pid" "$peer_ip" "$local_port" "$service"
+        fi
+    done
 }
 
 # ==========================================
@@ -462,26 +484,44 @@ feat5_history_1h() {
     fi
 
     # Coba journalctl dulu (lebih reliable di Ubuntu 20.04)
+    # FIX1 (v12-Sesi-2.3): Rewrite awk tanpa match() 3-arg (gawk extension).
+    # Pakai index() + split() yang support di mawk dan gawk.
     local events
     events=$(journalctl --since "1 hour ago" --no-pager -o short-iso 2>/dev/null | \
         grep -E "Accepted password|Password auth succeeded" | \
         awk '{
-            # Format: TIMESTAMP HOST SERVICE[PID]: MESSAGE
+            # Format: TIMESTAMP HOSTNAME SERVICE[PID]: MESSAGE
             timestamp = $1 " " $2
-            # Extract username and IP from message
-            if (match($0, /for (invalid user )?([a-zA-Z0-9_-]+) from ([0-9a-fA-F:.]+)/, arr)) {
-                user = arr[2]
-                ip = arr[3]
+            # Cek pola sshd: "Accepted password for USERNAME from IP port N ssh2"
+            if (index($0, "Accepted password for") > 0) {
+                # Split by "for " — second part = "username from ip port N ssh2"
+                # atau "invalid user username from ip port N ssh2"
+                n = split($0, a, "for ")
+                rest = a[2]
+                m = split(rest, b, " ")
+                if (b[1] == "invalid" && b[2] == "user") {
+                    user = b[3]
+                    ip = b[5]
+                } else {
+                    user = b[1]
+                    ip = b[3]
+                }
                 # Detect service
-                if ($0 ~ /sshd/) service = "SSH"
-                else if ($0 ~ /dropbear/) service = "Dropbear"
+                if (index($0, "sshd") > 0) service = "SSH"
+                else if (index($0, "dropbear") > 0) service = "Dropbear"
                 else service = "?"
                 printf "%s|%s|%s|%s\n", timestamp, user, ip, service
-            } else if (match($0, /Password auth succeeded for '"'"'([^'"'"']+)'"'"' from ([0-9a-fA-F:.]+)/, arr2)) {
-                user = arr2[1]
-                ip = arr2[2]
-                service = "Dropbear"
-                printf "%s|%s|%s|%s\n", timestamp, user, ip, service
+            }
+            # Cek pola dropbear: "Password auth succeeded for 'USERNAME' from IP:port"
+            else if (index($0, "Password auth succeeded for '"'"'") > 0) {
+                n = split($0, a, "for '"'"'")
+                rest = a[2]  # rest = "USERNAME' from IP:port"
+                # Split by "' from " — splits into [USERNAME, IP:port]
+                m = split(rest, b, "'"'"' from ")
+                user = b[1]
+                ip = b[2]
+                sub(/:[0-9]+$/, "", ip)
+                printf "%s|%s|%s|%s\n", timestamp, user, ip, "Dropbear"
             }
         }')
 
@@ -494,31 +534,39 @@ feat5_history_1h() {
         echo ""
         echo -e "${CYAN}[i] Mencoba fallback ke /var/log/auth.log...${NC}"
         # Fallback ke auth.log
+        # FIX1 (v12-Sesi-2.3): Rewrite awk tanpa match() 3-arg.
         if [ -f /var/log/auth.log ]; then
-            events=$(awk -v since="$(date -d '1 hour ago' '+%b %e %H:%M:%S' 2>/dev/null | sed 's/  / /g')" '
-            BEGIN {
-                # Calculate cutoff time (1 hour ago) using systime
-                cutoff = systime() - 3600
-            }
-            /Accepted password|Password auth succeeded/ {
-                # Try to parse month/day/time from line
-                # Format: "Mon DD HH:MM:SS ..."
+            events=$(awk '{
+                # Format auth.log: "Mon DD HH:MM:SS HOSTNAME SERVICE[PID]: MESSAGE"
                 month = $1
-                day = $2 + 0
+                day = $2
                 time = $3
-                split(time, t, ":")
-                hour = t[1] + 0
-                min = t[2] + 0
-                sec = t[3] + 0
-                # Convert month name to number
-                months = "JanFebMarAprMayJunJulAugSepOctNovDec"
-                mo = (index(months, month) + 2) / 3
-                # Build epoch (approximation — does not handle year boundary well)
-                # For simplicity, just show all matching events
-                if (match($0, /for (invalid user )?([a-zA-Z0-9_-]+) from ([0-9a-fA-F:.]+)/, arr)) {
-                    printf "%s %s %s|%s|%s|%s\n", month, day, time, arr[2], arr[3], ($0 ~ /sshd/ ? "SSH" : ($0 ~ /dropbear/ ? "Dropbear" : "?"))
-                } else if (match($0, /Password auth succeeded for '"'"'([^'"'"']+)'"'"' from ([0-9a-fA-F:.]+)/, arr2)) {
-                    printf "%s %s %s|%s|%s|Dropbear\n", month, day, time, arr2[1], arr2[2]
+                # Cek pola sshd
+                if (index($0, "Accepted password for") > 0) {
+                    n = split($0, a, "for ")
+                    rest = a[2]
+                    m = split(rest, b, " ")
+                    if (b[1] == "invalid" && b[2] == "user") {
+                        user = b[3]
+                        ip = b[5]
+                    } else {
+                        user = b[1]
+                        ip = b[3]
+                    }
+                    if (index($0, "sshd") > 0) service = "SSH"
+                    else if (index($0, "dropbear") > 0) service = "Dropbear"
+                    else service = "?"
+                    printf "%s %s %s|%s|%s|%s\n", month, day, time, user, ip, service
+                }
+                # Cek pola dropbear
+                else if (index($0, "Password auth succeeded for '"'"'") > 0) {
+                    n = split($0, a, "for '"'"'")
+                    rest = a[2]
+                    m = split(rest, b, "'"'"' from ")
+                    user = b[1]
+                    ip = b[2]
+                    sub(/:[0-9]+$/, "", ip)
+                    printf "%s %s %s|%s|%s|%s\n", month, day, time, user, ip, "Dropbear"
                 }
             }' /var/log/auth.log 2>/dev/null)
             event_count=$(echo "$events" | grep -c "|" 2>/dev/null || echo 0)
