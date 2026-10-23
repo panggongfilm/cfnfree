@@ -608,6 +608,17 @@ feat5_history_1h() {
     # FIX2 (v12-Sesi-2.3): Rewrite awk menggunakan sprintf("%c", 39) untuk single quote.
     # Alasan: Pattern '"'"' quoting kompleks rentan syntax error di mawk version beda.
     # sprintf("%c", 39) = single quote character, menghindari shell quoting hell.
+    #
+    # FITUR 05 REVISED (v13-Sesi-2.3-FIX3): Dedup username + format timestamp DD:MM:YYYY HH:MM:SS.
+    # User request (v13):
+    #   1. Tampilkan user HANYA 1x dalam 1 jam (tidak peduli berapa kali reconnect).
+    #   2. Format jam 24 jam: HH:MM:SS.
+    #   3. Format tanggal: DD:MM:YYYY.
+    #   4. Waktu Jakarta (WIB) — timezone journalctl sudah +0700, tinggal ubah format display.
+    #
+    # Output awk: sortable|display|user|ip|service (sortable untuk sort, display untuk show)
+    # Format ISO journalctl short-iso: "2026-10-24T02:05:15+0700" (fixed width).
+    # Pakai substr() untuk parse (mawk + gawk compatible, Lesson 11 aman).
     local events
     events=$(journalctl --since "1 hour ago" --no-pager -o short-iso 2>/dev/null | \
         grep -E "Accepted password|Password auth succeeded" | \
@@ -616,9 +627,18 @@ feat5_history_1h() {
         {
             # FIX3-D (v13): journalctl short-iso format = $1 berisi ISO datetime lengkap
             # (e.g., "2026-10-23T18:16:33+0700"), $2 = hostname (BUKAN time).
-            # Sebelumnya: timestamp = $1 " " $2 → hostname ikut ke timestamp column.
-            # Fix: timestamp = $1 saja.
-            timestamp = $1
+            raw_ts = $1
+            # Parse ISO format: YYYY-MM-DDTHH:MM:SS+TZ (fixed-width positions)
+            year   = substr(raw_ts, 1, 4)
+            month  = substr(raw_ts, 6, 2)
+            day    = substr(raw_ts, 9, 2)
+            hh     = substr(raw_ts, 12, 2)
+            mm     = substr(raw_ts, 15, 2)
+            ss     = substr(raw_ts, 18, 2)
+            # Sortable = YYYYMMDDHHMMSS (untuk sort numeric)
+            sortable = year month day hh mm ss
+            # Display = DD:MM:YYYY HH:MM:SS (WIB, format user request v13)
+            display = day ":" month ":" year " " hh ":" mm ":" ss
             if (index($0, "Accepted password for") > 0) {
                 n = split($0, a, "for ")
                 rest = a[2]
@@ -631,14 +651,11 @@ feat5_history_1h() {
                     ip = b[3]
                 }
                 # FIX3-C (v13): Filter root login events (sesuai user request v13).
-                # Root login biasanya internal SSH dari VPS sendiri (IP = VPS own IP).
-                # User ingin HIDE ini dari history ( hanya tampilkan user biasa).
-                # Untuk show root events: comment baris `next` di bawah.
                 if (user == "root") next
                 if (index($0, "sshd") > 0) service = "SSH"
                 else if (index($0, "dropbear") > 0) service = "Dropbear"
                 else service = "?"
-                printf "%s|%s|%s|%s\n", timestamp, user, ip, service
+                printf "%s|%s|%s|%s|%s\n", sortable, display, user, ip, service
             }
             else if (index($0, "Password auth succeeded for " sq) > 0) {
                 n = split($0, a, "for " sq)
@@ -649,7 +666,7 @@ feat5_history_1h() {
                 sub(/:[0-9]+$/, "", ip)
                 # FIX3-C (v13): Filter root login events (Dropbear auth)
                 if (user == "root") next
-                printf "%s|%s|%s|%s\n", timestamp, user, ip, "Dropbear"
+                printf "%s|%s|%s|%s|%s\n", sortable, display, user, ip, "Dropbear"
             }
         }')
 
@@ -666,16 +683,34 @@ feat5_history_1h() {
         echo -e "${GRAY}    Atau journalctl tidak menyimpan log auth.${NC}"
         echo ""
         echo -e "${CYAN}[i] Mencoba fallback ke /var/log/auth.log...${NC}"
-        # Fallback ke auth.log
-        # FIX2 (v12-Sesi-2.3): Rewrite awk pakai sprintf("%c", 39) untuk single quote.
+        # Fallback ke auth.log (FIX2 awk pakai sprintf + month map, output format sama: sortable|display|user|ip|service)
         if [ -f /var/log/auth.log ]; then
             events=$(awk '
-            BEGIN { sq = sprintf("%c", 39) }
+            BEGIN {
+                sq = sprintf("%c", 39)
+                # Month name → number map (untuk parse syslog format auth.log)
+                months["Jan"]="01"; months["Feb"]="02"; months["Mar"]="03"; months["Apr"]="04"
+                months["May"]="05"; months["Jun"]="06"; months["Jul"]="07"; months["Aug"]="08"
+                months["Sep"]="09"; months["Oct"]="10"; months["Nov"]="11"; months["Dec"]="12"
+                # Dapatkan tahun system (auth.log format tidak menyertakan tahun).
+                "date +%Y" | getline year
+                close("date +%Y")
+            }
             {
-                # /var/log/auth.log format: $1=month $2=day $3=time
-                month = $1
+                # /var/log/auth.log format: $1=month_name $2=day $3=time HH:MM:SS
+                month_name = $1
                 day = $2
                 time = $3
+                month = months[month_name]
+                if (month == "") next  # invalid month name
+                # Pad day to 2 digits (auth.log kadang "Oct  4" → day="4")
+                if (length(day) == 1) day = "0" day
+                # Parse time HH:MM:SS
+                split(time, t, ":")
+                hh = t[1]; mm = t[2]; ss = t[3]
+                # Sortable + display (sama format seperti journalctl path)
+                sortable = year month day hh mm ss
+                display = day ":" month ":" year " " hh ":" mm ":" ss
                 if (index($0, "Accepted password for") > 0) {
                     n = split($0, a, "for ")
                     rest = a[2]
@@ -692,7 +727,7 @@ feat5_history_1h() {
                     if (index($0, "sshd") > 0) service = "SSH"
                     else if (index($0, "dropbear") > 0) service = "Dropbear"
                     else service = "?"
-                    printf "%s %s %s|%s|%s|%s\n", month, day, time, user, ip, service
+                    printf "%s|%s|%s|%s|%s\n", sortable, display, user, ip, service
                 }
                 else if (index($0, "Password auth succeeded for " sq) > 0) {
                     n = split($0, a, "for " sq)
@@ -703,7 +738,7 @@ feat5_history_1h() {
                     sub(/:[0-9]+$/, "", ip)
                     # FIX3-C (v13): Filter root login events (auth.log path Dropbear)
                     if (user == "root") next
-                    printf "%s %s %s|%s|%s|%s\n", month, day, time, user, ip, "Dropbear"
+                    printf "%s|%s|%s|%s|%s\n", sortable, display, user, ip, "Dropbear"
                 }
             }' /var/log/auth.log 2>/dev/null)
             event_count=$(printf "%s\n" "$events" | grep "|" | wc -l)
@@ -717,19 +752,28 @@ feat5_history_1h() {
         fi
     fi
 
-    echo -e "${GREEN}[+] Ditemukan $event_count event login dalam 1 jam terakhir:${NC}"
-    echo ""
-    printf "%-25s %-15s %-18s %-10s\n" "TIMESTAMP" "USERNAME" "IP ADDRESS" "SERVICE"
-    printf "%-25s %-15s %-18s %-10s\n" "---------" "--------" "----------" "-------"
+    # FITUR 05 REVISED (v13): Dedup username — tampilkan 1 row per user (terbaru).
+    # Sort by sortable DESC (terbaru di atas), lalu dedup by user (ambil first occurrence).
+    # Output: unique_entries dengan format sortable|display|user|ip|service.
+    local unique_entries unique_count
+    unique_entries=$(printf "%s\n" "$events" | sort -t'|' -k1,1nr | awk -F'|' '!seen[$3]++')
+    unique_count=$(printf "%s\n" "$unique_entries" | grep "|" | wc -l)
+    [ -z "$unique_entries" ] && unique_count=0
 
-    echo "$events" | tail -50 | while IFS='|' read -r ts user ip service; do
-        [ -z "$ts" ] && continue
-        printf "%-25s %-15s %-18s %-10s\n" "$ts" "$user" "$ip" "$service"
+    echo -e "${GREEN}[+] Ditemukan $unique_count user aktif dalam 1 jam terakhir:${NC}"
+    echo ""
+    printf "%-22s %-15s %-18s %-10s\n" "WAKTU LOGIN (WIB)" "USERNAME" "IP ADDRESS" "SERVICE"
+    printf "%-22s %-15s %-18s %-10s\n" "-----------------" "--------" "----------" "-------"
+
+    # Skip sortable field ($1 = _), display fields display|user|ip|service
+    echo "$unique_entries" | while IFS='|' read -r _ display_ts user ip service; do
+        [ -z "$display_ts" ] && continue
+        printf "%-22s %-15s %-18s %-10s\n" "$display_ts" "$user" "$ip" "$service"
     done
 
-    if [ "$event_count" -gt 50 ]; then
+    if [ "$event_count" -gt "$unique_count" ] && [ "$unique_count" -gt 0 ]; then
         echo ""
-        echo -e "${YELLOW}[i] Menampilkan 50 event terbaru. Total: $event_count event.${NC}"
+        echo -e "${GRAY}[*] Note: $event_count total event login, tampilkan $unique_count user unik (dedup).${NC}"
     fi
 
     echo ""
