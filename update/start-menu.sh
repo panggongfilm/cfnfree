@@ -73,7 +73,6 @@ echo -e "$BLUE=======================================$NC"
 sshs=$(systemctl status ssh | grep Active: | awk '{print $2}')
 wstls=$(systemctl status ws-tls | grep Active: | awk '{print $2}')
 wsnontls=$(systemctl status ws-nontls | grep Active: | awk '{print $2}')
-ovpns=$(systemctl status openvpn-ohp | grep Active: | awk '{print $2}')
 sttunl5=$(systemctl status stunnel5 | grep Active: | awk '{print $2}')
 dropbears=$(systemctl status dropbear | grep Active: | awk '{print $2}')
 nginxs=$(systemctl status nginx | grep Active: | awk '{print $2}')
@@ -97,11 +96,6 @@ if [ "$wsnontls" == "$ell" ]; then
 echo -e " Websocket Non TLS       :$GREEN [Running] $NC"
 else
 echo -e " Websocket Non TLS       :$RED [Error] $NC"
-fi
-if [ "$ovpns" == "$ell" ]; then
-echo -e " OpenVPN                 :$GREEN [Running] $NC"
-else
-echo -e " OpenVpn                 :$RED [Error] $NC"
 fi
 if [ "$sttunl5" == "$ell" ]; then
 echo -e " Stunnel 5               :$GREEN [Running] $NC"
