@@ -588,13 +588,25 @@ feat4_candidates_multilogin() {
 }
 
 # ==========================================
-# FITUR 5: History User (1 Jam Terakhir)
-# Tampilkan event login SSH/Dropbear 1 jam terakhir
+# FITUR 5: User Activity Dashboard (Active + Recent Disconnects)
+# FITUR 05 REWORKED (v13-Sesi-2.3-FIX3):
+#   Logika baru sesuai user request (v13):
+#     1. User AKTIF sekarang (via ss) → TETAP tampil walau login >1 jam lalu.
+#     2. User OFFLINE tapi last login <= 1 jam → tampil (recent disconnect).
+#     3. User OFFLINE + last login >1 jam → HAPUS dari daftar.
+#   Approach:
+#     - Dapatkan active users set via ss + resolve_user_from_pid.
+#     - Dapatkan login events dari journalctl --since "24 hours ago" (wider window
+#       supaya dapat login time untuk active users walau login-nya >1 jam lalu).
+#     - Dedup by user (ambil latest login per user).
+#     - Filter: tampilkan jika user AKTIF ATAU last_login <= 1 hour ago.
+#     - Tambah kolom STATUS (AKTIF/OFFLINE) — plain text (Lesson 13).
 # ==========================================
 feat5_history_1h() {
     show_header
-    echo -e "${CYAN}[*] FITUR 05: History User (1 Jam Terakhir)${NC}"
+    echo -e "${CYAN}[*] FITUR 05: User Activity Dashboard${NC}"
     echo -e "${GRAY}----------------------------------------------${NC}"
+    echo -e "${GRAY}    Logika: AKTIF sekarang + OFFLINE <1 jam terakhir${NC}"
     echo ""
 
     if ! command -v journalctl >/dev/null 2>&1; then
@@ -604,40 +616,40 @@ feat5_history_1h() {
         return
     fi
 
-    # Coba journalctl dulu (lebih reliable di Ubuntu 20.04)
-    # FIX2 (v12-Sesi-2.3): Rewrite awk menggunakan sprintf("%c", 39) untuk single quote.
-    # Alasan: Pattern '"'"' quoting kompleks rentan syntax error di mawk version beda.
-    # sprintf("%c", 39) = single quote character, menghindari shell quoting hell.
-    #
-    # FITUR 05 REVISED (v13-Sesi-2.3-FIX3): Dedup username + format timestamp DD:MM:YYYY HH:MM:SS.
-    # User request (v13):
-    #   1. Tampilkan user HANYA 1x dalam 1 jam (tidak peduli berapa kali reconnect).
-    #   2. Format jam 24 jam: HH:MM:SS.
-    #   3. Format tanggal: DD:MM:YYYY.
-    #   4. Waktu Jakarta (WIB) — timezone journalctl sudah +0700, tinggal ubah format display.
-    #
-    # Output awk: sortable|display|user|ip|service (sortable untuk sort, display untuk show)
-    # Format ISO journalctl short-iso: "2026-10-24T02:05:15+0700" (fixed width).
-    # Pakai substr() untuk parse (mawk + gawk compatible, Lesson 11 aman).
+    # STEP 1: Dapatkan active users set via ss + resolve_user_from_pid.
+    # Ini user yang masih terhubung sekarang (sama seperti Fitur 02).
+    local active_users_list=""
+    if command -v ss >/dev/null 2>&1; then
+        local active_conns
+        active_conns=$(get_active_connections)
+        active_users_list=$(echo "$active_conns" | while IFS='|' read -r pid peer_ip local_port service; do
+            [ -z "$pid" ] && continue
+            local u
+            u=$(resolve_user_from_pid "$pid")
+            # Filter user yang valid (bukan '-', '?', atau 'root')
+            if [ -n "$u" ] && [ "$u" != "-" ] && [ "$u" != "?" ] && [ "$u" != "root" ]; then
+                echo "$u"
+            fi
+        done | sort -u | tr '\n' ',' | sed 's/,$//')
+    fi
+
+    # STEP 2: Dapatkan login events dari journalctl (window 24 jam, BUKAN 1 jam).
+    # Window lebih lebar supaya dapat login time untuk active users yang login >1 jam lalu.
+    # Output format: sortable|display|user|ip|service
     local events
-    events=$(journalctl --since "1 hour ago" --no-pager -o short-iso 2>/dev/null | \
+    events=$(journalctl --since "24 hours ago" --no-pager -o short-iso 2>/dev/null | \
         grep -E "Accepted password|Password auth succeeded" | \
         awk '
         BEGIN { sq = sprintf("%c", 39) }
         {
-            # FIX3-D (v13): journalctl short-iso format = $1 berisi ISO datetime lengkap
-            # (e.g., "2026-10-23T18:16:33+0700"), $2 = hostname (BUKAN time).
             raw_ts = $1
-            # Parse ISO format: YYYY-MM-DDTHH:MM:SS+TZ (fixed-width positions)
             year   = substr(raw_ts, 1, 4)
             month  = substr(raw_ts, 6, 2)
             day    = substr(raw_ts, 9, 2)
             hh     = substr(raw_ts, 12, 2)
             mm     = substr(raw_ts, 15, 2)
             ss     = substr(raw_ts, 18, 2)
-            # Sortable = YYYYMMDDHHMMSS (untuk sort numeric)
             sortable = year month day hh mm ss
-            # Display = DD:MM:YYYY HH:MM:SS (WIB, format user request v13)
             display = day ":" month ":" year " " hh ":" mm ":" ss
             if (index($0, "Accepted password for") > 0) {
                 n = split($0, a, "for ")
@@ -650,7 +662,6 @@ feat5_history_1h() {
                     user = b[1]
                     ip = b[3]
                 }
-                # FIX3-C (v13): Filter root login events (sesuai user request v13).
                 if (user == "root") next
                 if (index($0, "sshd") > 0) service = "SSH"
                 else if (index($0, "dropbear") > 0) service = "Dropbear"
@@ -664,51 +675,37 @@ feat5_history_1h() {
                 user = b[1]
                 ip = b[2]
                 sub(/:[0-9]+$/, "", ip)
-                # FIX3-C (v13): Filter root login events (Dropbear auth)
                 if (user == "root") next
                 printf "%s|%s|%s|%s|%s\n", sortable, display, user, ip, "Dropbear"
             }
         }')
 
-    # FIX2: gunakan wc -l (BUKAN grep -c | || echo 0)
-    # Alasan: grep -c returns '0' + exit 1, lalu || echo 0 fires,
-    # hasil '0\n0' multiline → error [ "$count" -eq 0 ] integer expression expected.
-    # wc -l selalu return single integer (0 untuk empty input).
+    # Fallback ke /var/log/auth.log (kalau journalctl tidak ada result)
     local event_count
     event_count=$(printf "%s\n" "$events" | grep "|" | wc -l)
     [ -z "$events" ] && event_count=0
 
     if [ "$event_count" -eq 0 ]; then
-        echo -e "${YELLOW}[i] Tidak ada event login SSH/Dropbear dalam 1 jam terakhir.${NC}"
-        echo -e "${GRAY}    Atau journalctl tidak menyimpan log auth.${NC}"
-        echo ""
-        echo -e "${CYAN}[i] Mencoba fallback ke /var/log/auth.log...${NC}"
-        # Fallback ke auth.log (FIX2 awk pakai sprintf + month map, output format sama: sortable|display|user|ip|service)
+        echo -e "${CYAN}[i] journalctl kosong, mencoba fallback ke /var/log/auth.log...${NC}"
         if [ -f /var/log/auth.log ]; then
             events=$(awk '
             BEGIN {
                 sq = sprintf("%c", 39)
-                # Month name → number map (untuk parse syslog format auth.log)
                 months["Jan"]="01"; months["Feb"]="02"; months["Mar"]="03"; months["Apr"]="04"
                 months["May"]="05"; months["Jun"]="06"; months["Jul"]="07"; months["Aug"]="08"
                 months["Sep"]="09"; months["Oct"]="10"; months["Nov"]="11"; months["Dec"]="12"
-                # Dapatkan tahun system (auth.log format tidak menyertakan tahun).
                 "date +%Y" | getline year
                 close("date +%Y")
             }
             {
-                # /var/log/auth.log format: $1=month_name $2=day $3=time HH:MM:SS
                 month_name = $1
                 day = $2
                 time = $3
                 month = months[month_name]
-                if (month == "") next  # invalid month name
-                # Pad day to 2 digits (auth.log kadang "Oct  4" → day="4")
+                if (month == "") next
                 if (length(day) == 1) day = "0" day
-                # Parse time HH:MM:SS
                 split(time, t, ":")
                 hh = t[1]; mm = t[2]; ss = t[3]
-                # Sortable + display (sama format seperti journalctl path)
                 sortable = year month day hh mm ss
                 display = day ":" month ":" year " " hh ":" mm ":" ss
                 if (index($0, "Accepted password for") > 0) {
@@ -722,7 +719,6 @@ feat5_history_1h() {
                         user = b[1]
                         ip = b[3]
                     }
-                    # FIX3-C (v13): Filter root login events (auth.log path juga)
                     if (user == "root") next
                     if (index($0, "sshd") > 0) service = "SSH"
                     else if (index($0, "dropbear") > 0) service = "Dropbear"
@@ -736,7 +732,6 @@ feat5_history_1h() {
                     user = b[1]
                     ip = b[2]
                     sub(/:[0-9]+$/, "", ip)
-                    # FIX3-C (v13): Filter root login events (auth.log path Dropbear)
                     if (user == "root") next
                     printf "%s|%s|%s|%s|%s\n", sortable, display, user, ip, "Dropbear"
                 }
@@ -744,39 +739,79 @@ feat5_history_1h() {
             event_count=$(printf "%s\n" "$events" | grep "|" | wc -l)
             [ -z "$events" ] && event_count=0
         fi
-
-        if [ "$event_count" -eq 0 ]; then
-            echo -e "${YELLOW}[i] Tidak ada event login ditemukan di /var/log/auth.log juga.${NC}"
-            pause
-            return
-        fi
     fi
 
-    # FITUR 05 REVISED (v13): Dedup username — tampilkan 1 row per user (terbaru).
-    # Sort by sortable DESC (terbaru di atas), lalu dedup by user (ambil first occurrence).
-    # Output: unique_entries dengan format sortable|display|user|ip|service.
-    local unique_entries unique_count
+    # STEP 3: Sort + dedup by user (ambil latest login per user).
+    local unique_entries
     unique_entries=$(printf "%s\n" "$events" | sort -t'|' -k1,1nr | awk -F'|' '!seen[$3]++')
-    unique_count=$(printf "%s\n" "$unique_entries" | grep "|" | wc -l)
-    [ -z "$unique_entries" ] && unique_count=0
 
-    echo -e "${GREEN}[+] Ditemukan $unique_count user aktif dalam 1 jam terakhir:${NC}"
+    # STEP 4: Filter — tampilkan user jika AKTIF ATAU last_login <= 1 hour ago.
+    # Hitung sortable untuk "1 hour ago" (format YYYYMMDDHHMMSS untuk string comparison).
+    local one_hour_ago_sortable
+    one_hour_ago_sortable=$(date -d '1 hour ago' +%Y%m%d%H%M%S 2>/dev/null)
+
+    local filtered_entries
+    filtered_entries=$(echo "$unique_entries" | while IFS='|' read -r sortable display user ip service; do
+        [ -z "$display" ] && continue
+
+        # Cek apakah user ada di active_users_list (comma-separated)
+        # Pattern match: ,username, di dalam ,user1,user2,user3,
+        local is_active=0
+        if [ -n "$active_users_list" ]; then
+            case ",$active_users_list," in
+                *",$user,"*) is_active=1 ;;
+            esac
+        fi
+
+        # Cek apakah last login <= 1 hour ago (string comparison karena sortable = YYYYMMDDHHMMSS)
+        # Bash [[ ]] string comparison: lexicographic, tapi format YYYYMMDDHHMMSS sortable secara lexicographic.
+        local is_recent=0
+        if [ -n "$sortable" ] && [ -n "$one_hour_ago_sortable" ]; then
+            if [[ "$sortable" > "$one_hour_ago_sortable" ]] || [[ "$sortable" == "$one_hour_ago_sortable" ]]; then
+                is_recent=1
+            fi
+        fi
+
+        # Filter: tampilkan jika AKTIF ATAU recent
+        if [ "$is_active" = "1" ] || [ "$is_recent" = "1" ]; then
+            local status_text="OFFLINE"
+            [ "$is_active" = "1" ] && status_text="AKTIF"
+            printf "%s|%s|%s|%s|%s|%s\n" "$sortable" "$display" "$user" "$ip" "$service" "$status_text"
+        fi
+    done)
+
+    # STEP 5: Display.
+    local display_count
+    display_count=$(printf "%s\n" "$filtered_entries" | grep "|" | wc -l)
+    [ -z "$filtered_entries" ] && display_count=0
+
+    if [ "$display_count" -eq 0 ]; then
+        echo -e "${YELLOW}[i] Tidak ada user dalam daftar history.${NC}"
+        echo -e "${GRAY}    (Tidak ada user aktif + tidak ada login dalam 1 jam terakhir)${NC}"
+        pause
+        return
+    fi
+
+    # Hitung jumlah AKTIF vs OFFLINE untuk info header
+    local active_count offline_count
+    active_count=$(echo "$filtered_entries" | grep -c "|AKTIF$")
+    offline_count=$(echo "$filtered_entries" | grep -c "|OFFLINE$")
+
+    echo -e "${GREEN}[+] Ditemukan $display_count user (${active_count} aktif, ${offline_count} recent <1 jam):${NC}"
     echo ""
-    printf "%-22s %-15s %-18s %-10s\n" "WAKTU LOGIN (WIB)" "USERNAME" "IP ADDRESS" "SERVICE"
-    printf "%-22s %-15s %-18s %-10s\n" "-----------------" "--------" "----------" "-------"
+    # Plain text header (Lesson 13 — hindari ANSI width miscalculation)
+    printf "%-22s %-15s %-18s %-10s %-8s\n" "WAKTU LOGIN (WIB)" "USERNAME" "IP ADDRESS" "SERVICE" "STATUS"
+    printf "%-22s %-15s %-18s %-10s %-8s\n" "-----------------" "--------" "----------" "-------" "------"
 
-    # Skip sortable field ($1 = _), display fields display|user|ip|service
-    echo "$unique_entries" | while IFS='|' read -r _ display_ts user ip service; do
+    # Skip sortable ($1=_), tampilkan display|user|ip|service|status (plain text)
+    echo "$filtered_entries" | while IFS='|' read -r _ display_ts user ip service status_text; do
         [ -z "$display_ts" ] && continue
-        printf "%-22s %-15s %-18s %-10s\n" "$display_ts" "$user" "$ip" "$service"
+        printf "%-22s %-15s %-18s %-10s %-8s\n" "$display_ts" "$user" "$ip" "$service" "$status_text"
     done
 
-    if [ "$event_count" -gt "$unique_count" ] && [ "$unique_count" -gt 0 ]; then
-        echo ""
-        echo -e "${GRAY}[*] Note: $event_count total event login, tampilkan $unique_count user unik (dedup).${NC}"
-    fi
-
     echo ""
+    echo -e "${GRAY}[*] AKTIF   = user masih terhubung saat ini (via ss)${NC}"
+    echo -e "${GRAY}[*] OFFLINE = user terputus, login terakhir <1 jam yang lalu${NC}"
     echo -e "${GRAY}[*] Refresh: jalankan ulang opsi 05 untuk update terbaru${NC}"
     pause
 }
