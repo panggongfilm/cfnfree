@@ -107,8 +107,10 @@ handle_choice() {
         05|5)
             clear
             start-menu
+            echo
+            read -p "${GRAY}  Tekan enter untuk kembali ke menu utama...${NC}" dummy
             ;;
-        06|06)
+        06|6)
             reboot_vps
             ;;
         07|7)
