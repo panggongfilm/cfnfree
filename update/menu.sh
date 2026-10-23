@@ -91,18 +91,26 @@ handle_choice() {
         01|1)
             clear
             maddssh
+            echo
+            read -p "${GRAY}  Tekan enter untuk kembali ke menu utama...${NC}" dummy
             ;;
         02|2)
             clear
             sslh-fix-reboot
+            echo
+            read -p "${GRAY}  Tekan enter untuk kembali ke menu utama...${NC}" dummy
             ;;
         03|3)
             clear
             mbackup
+            echo
+            read -p "${GRAY}  Tekan enter untuk kembali ke menu utama...${NC}" dummy
             ;;
         04|4)
             clear
             msetting
+            echo
+            read -p "${GRAY}  Tekan enter untuk kembali ke menu utama...${NC}" dummy
             ;;
         05|5)
             clear
