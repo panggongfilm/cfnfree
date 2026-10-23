@@ -129,14 +129,26 @@ get_active_connections() {
 # Function resolve_user_from_pid()
 # Dapatkan username LOGIN yang sebenarnya dari PID koneksi SSH/Dropbear.
 #
-# FIX2 (v12-Sesi-2.3): Pakai ps -o args=, BUKAN ps -o user=.
-# Alasan: ps -o user= mengembalikan PROCESS OWNER (sshd/root),
-# BUKAN user login yang sebenarnya.
-# Untuk SSH: process owner = 'sshd' (privilege separation),
-#   tapi user login ada di args: 'sshd: USER [priv]' atau 'sshd: USER@notty'
-# Untuk Dropbear: process owner = root, user login ada di args:
-#   'dropbear -F -p 109 ...'
-#   (dropbear tidak menampilkan user di args, perlu cara lain)
+# FIX3 (v13-Sesi-2.3-FIX3): Prioritaskan /proc/<pid>/loginuid sebagai resolver utama
+# Alasan: loginuid = UID user yang LOGIN (BUKAN process owner).
+#   - Linux kernel native, robust untuk SEMUA pattern args (sshd [priv], sshd@notty,
+#     sshd@pts/X, dropbear master, dropbear child, sshd -D master, dll)
+#   - Tidak dependen pada format args ps -o args= (yang bisa bervariasi)
+#   - Handle race condition: cek /proc/<pid>/ exists sebelum ps (process mungkin exit)
+#
+# Pelajaran FIX3-A (v13): PID 19739 (SSH external connection) masih return '-'
+#   karena args format bukan pattern `sshd: USER [priv]` atau `sshd: USER@notty`
+#   (kemungkinan `sshd: USER@pts/X` ATAU process sudah exit sebelum ps jalan).
+#   loginuid approach resolve issue ini tanpa tergantung args format.
+#
+# PATTERN 18 (NEW v13): /proc/<pid>/loginuid untuk resolve user (lebih robust dari ps args)
+#   loginuid di-set oleh PAM saat user login (SSH/interactive).
+#   - Untuk user biasa: loginuid = UID user (e.g., 1001)
+#   - Untuk root login: loginuid = 0
+#   - Untuk master/system process: loginuid = -1 (uint 4294967295) — TIDAK punya login context
+#
+# FIX2 (v12-Sesi-2.3): Pertahankan ps -o args= + proc status sebagai fallback
+#   untuk edge cases (Dropbear tanpa PAM, container tanpa /proc/loginuid, dll).
 # ==========================================
 resolve_user_from_pid() {
     local pid="$1"
@@ -145,36 +157,68 @@ resolve_user_from_pid() {
         return
     fi
 
+    # FIX3-A: Handle race condition — cek /proc/<pid>/ exists SEBELUM ps
+    # Process mungkin exit antara ss -tnp (capture PID) dan ps -p (resolve user)
+    if [ ! -d "/proc/$pid" ]; then
+        echo "-"
+        return
+    fi
+
+    # STEP 1 (FIX3-A, PATTERN 18): Cek /proc/<pid>/loginuid — paling robust
+    # loginuid = UID user yang LOGIN, BUKAN process owner.
+    # -1 atau 4294967295 = process tidak punya login context (master/system)
+    if [ -r "/proc/$pid/loginuid" ]; then
+        local login_uid
+        login_uid=$(cat "/proc/$pid/loginuid" 2>/dev/null)
+        # loginuid -1 (int) atau 4294967295 (uint) = unset login context
+        if [ -n "$login_uid" ] && [ "$login_uid" != "-1" ] && [ "$login_uid" != "4294967295" ]; then
+            local login_user
+            login_user=$(getent passwd "$login_uid" 2>/dev/null | cut -d: -f1)
+            if [ -n "$login_user" ]; then
+                echo "$login_user"
+                return
+            fi
+        fi
+    fi
+
+    # STEP 2: Fallback ke ps -o args= (untuk edge cases: Dropbear tanpa PAM, container, dll)
     local args user=""
     args=$(ps -p "$pid" -o args= 2>/dev/null | head -1)
 
-    # Pattern 1: SSH "sshd: USER [priv]" atau "sshd: USER@..."
-    if [[ $args =~ ^sshd:\ ([a-zA-Z0-9_.-]+) ]]; then
-        user="${BASH_REMATCH[1]}"
-        # Filter out system process patterns (sshd: root atau sshd: system)
-        if [ "$user" != "root" ] && [ "$user" != "system" ]; then
-            echo "$user"
+    # Jika args kosong = process sudah exit (race condition caught di step 0)
+    if [ -n "$args" ]; then
+        # Pattern 2a: SSH "sshd: USER [priv]" atau "sshd: USER@..."
+        if [[ $args =~ ^sshd:\ ([a-zA-Z0-9_.-]+) ]]; then
+            user="${BASH_REMATCH[1]}"
+            # Filter out system process patterns (sshd: root atau sshd: system)
+            if [ "$user" != "root" ] && [ "$user" != "system" ]; then
+                echo "$user"
+                return
+            fi
+        fi
+
+        # Pattern 2b: Dropbear — user tidak ada di args, pakai ps -o user=
+        # Dropbear process owner biasanya = user yang login (child process)
+        # Untuk master listener: proc_owner = root → di-filter → return '-' (expected)
+        local proc_owner
+        proc_owner=$(ps -p "$pid" -o user= 2>/dev/null | head -1)
+        if [ -n "$proc_owner" ] && [ "$proc_owner" != "root" ] && [ "$proc_owner" != "sshd" ] && [ "$proc_owner" != "nobody" ] && [ "$proc_owner" != "system" ]; then
+            echo "$proc_owner"
             return
         fi
     fi
 
-    # Pattern 2: Dropbear — user tidak ada di args, pakai ps -o user=
-    # Dropbear process owner biasanya = user yang login
-    local proc_owner
-    proc_owner=$(ps -p "$pid" -o user= 2>/dev/null | head -1)
-    if [ -n "$proc_owner" ] && [ "$proc_owner" != "root" ] && [ "$proc_owner" != "sshd" ] && [ "$proc_owner" != "nobody" ]; then
-        echo "$proc_owner"
-        return
-    fi
-
-    # Fallback: cek /proc/<pid>/status (Uid line)
+    # STEP 3: Fallback ke /proc/<pid>/status (Uid line — process real UID)
+    # Uid = process real UID (BUKAN loginuid). Untuk sshd [priv]: Uid=0 (root).
+    # Hanya pakai kalau Uid != 0 (root) — exclude system process.
     if [ -r "/proc/$pid/status" ]; then
-        local uid
-        uid=$(grep "^Uid:" "/proc/$pid/status" 2>/dev/null | awk '{print $2}')
-        if [ -n "$uid" ] && [ "$uid" != "0" ]; then
-            user=$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)
-            if [ -n "$user" ] && [ "$user" != "root" ]; then
-                echo "$user"
+        local status_uid
+        status_uid=$(grep "^Uid:" "/proc/$pid/status" 2>/dev/null | awk '{print $2}')
+        if [ -n "$status_uid" ] && [ "$status_uid" != "0" ]; then
+            local status_user
+            status_user=$(getent passwd "$status_uid" 2>/dev/null | cut -d: -f1)
+            if [ -n "$status_user" ] && [ "$status_user" != "root" ]; then
+                echo "$status_user"
                 return
             fi
         fi
@@ -522,7 +566,11 @@ feat5_history_1h() {
         awk '
         BEGIN { sq = sprintf("%c", 39) }
         {
-            timestamp = $1 " " $2
+            # FIX3-D (v13): journalctl short-iso format = $1 berisi ISO datetime lengkap
+            # (e.g., "2026-10-23T18:16:33+0700"), $2 = hostname (BUKAN time).
+            # Sebelumnya: timestamp = $1 " " $2 → hostname ikut ke timestamp column.
+            # Fix: timestamp = $1 saja.
+            timestamp = $1
             if (index($0, "Accepted password for") > 0) {
                 n = split($0, a, "for ")
                 rest = a[2]
@@ -534,6 +582,11 @@ feat5_history_1h() {
                     user = b[1]
                     ip = b[3]
                 }
+                # FIX3-C (v13): Filter root login events (sesuai user request v13).
+                # Root login biasanya internal SSH dari VPS sendiri (IP = VPS own IP).
+                # User ingin HIDE ini dari history ( hanya tampilkan user biasa).
+                # Untuk show root events: comment baris `next` di bawah.
+                if (user == "root") next
                 if (index($0, "sshd") > 0) service = "SSH"
                 else if (index($0, "dropbear") > 0) service = "Dropbear"
                 else service = "?"
@@ -546,6 +599,8 @@ feat5_history_1h() {
                 user = b[1]
                 ip = b[2]
                 sub(/:[0-9]+$/, "", ip)
+                # FIX3-C (v13): Filter root login events (Dropbear auth)
+                if (user == "root") next
                 printf "%s|%s|%s|%s\n", timestamp, user, ip, "Dropbear"
             }
         }')
@@ -569,6 +624,7 @@ feat5_history_1h() {
             events=$(awk '
             BEGIN { sq = sprintf("%c", 39) }
             {
+                # /var/log/auth.log format: $1=month $2=day $3=time
                 month = $1
                 day = $2
                 time = $3
@@ -583,6 +639,8 @@ feat5_history_1h() {
                         user = b[1]
                         ip = b[3]
                     }
+                    # FIX3-C (v13): Filter root login events (auth.log path juga)
+                    if (user == "root") next
                     if (index($0, "sshd") > 0) service = "SSH"
                     else if (index($0, "dropbear") > 0) service = "Dropbear"
                     else service = "?"
@@ -595,6 +653,8 @@ feat5_history_1h() {
                     user = b[1]
                     ip = b[2]
                     sub(/:[0-9]+$/, "", ip)
+                    # FIX3-C (v13): Filter root login events (auth.log path Dropbear)
+                    if (user == "root") next
                     printf "%s %s %s|%s|%s|%s\n", month, day, time, user, ip, "Dropbear"
                 }
             }' /var/log/auth.log 2>/dev/null)
