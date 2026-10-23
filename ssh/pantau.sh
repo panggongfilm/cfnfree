@@ -127,7 +127,16 @@ get_active_connections() {
 
 # ==========================================
 # Function resolve_user_from_pid()
-# Dapatkan username dari PID via /proc/<pid>/status
+# Dapatkan username LOGIN yang sebenarnya dari PID koneksi SSH/Dropbear.
+#
+# FIX2 (v12-Sesi-2.3): Pakai ps -o args=, BUKAN ps -o user=.
+# Alasan: ps -o user= mengembalikan PROCESS OWNER (sshd/root),
+# BUKAN user login yang sebenarnya.
+# Untuk SSH: process owner = 'sshd' (privilege separation),
+#   tapi user login ada di args: 'sshd: USER [priv]' atau 'sshd: USER@notty'
+# Untuk Dropbear: process owner = root, user login ada di args:
+#   'dropbear -F -p 109 ...'
+#   (dropbear tidak menampilkan user di args, perlu cara lain)
 # ==========================================
 resolve_user_from_pid() {
     local pid="$1"
@@ -135,18 +144,34 @@ resolve_user_from_pid() {
         echo "?"
         return
     fi
-    # Coba via ps dulu (lebih reliable)
-    local user
-    user=$(ps -p "$pid" -o user= 2>/dev/null | head -1)
-    if [ -n "$user" ] && [ "$user" != "root" ]; then
-        echo "$user"
+
+    local args user=""
+    args=$(ps -p "$pid" -o args= 2>/dev/null | head -1)
+
+    # Pattern 1: SSH "sshd: USER [priv]" atau "sshd: USER@..."
+    if [[ $args =~ ^sshd:\ ([a-zA-Z0-9_.-]+) ]]; then
+        user="${BASH_REMATCH[1]}"
+        # Filter out system process patterns (sshd: root atau sshd: system)
+        if [ "$user" != "root" ] && [ "$user" != "system" ]; then
+            echo "$user"
+            return
+        fi
+    fi
+
+    # Pattern 2: Dropbear — user tidak ada di args, pakai ps -o user=
+    # Dropbear process owner biasanya = user yang login
+    local proc_owner
+    proc_owner=$(ps -p "$pid" -o user= 2>/dev/null | head -1)
+    if [ -n "$proc_owner" ] && [ "$proc_owner" != "root" ] && [ "$proc_owner" != "sshd" ] && [ "$proc_owner" != "nobody" ]; then
+        echo "$proc_owner"
         return
     fi
+
     # Fallback: cek /proc/<pid>/status (Uid line)
     if [ -r "/proc/$pid/status" ]; then
         local uid
         uid=$(grep "^Uid:" "/proc/$pid/status" 2>/dev/null | awk '{print $2}')
-        if [ -n "$uid" ]; then
+        if [ -n "$uid" ] && [ "$uid" != "0" ]; then
             user=$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)
             if [ -n "$user" ] && [ "$user" != "root" ]; then
                 echo "$user"
@@ -154,6 +179,7 @@ resolve_user_from_pid() {
             fi
         fi
     fi
+
     echo "-"
 }
 
@@ -345,25 +371,28 @@ feat3_all_users_limit() {
     # List semua SSH user (UID >= 1000, exclude nobody/nobody)
     echo -e "${CYAN}[i] Daftar semua SSH user:${NC}"
     echo ""
-    printf "%-20s %-15s %-15s %-12s\n" "USERNAME" "EXPIRY DATE" "STATUS" "UID"
-    printf "%-20s %-15s %-15s %-12s\n" "--------" "-----------" "------" "---"
+    printf "%-20s %-18s %-12s %-8s\n" "USERNAME" "EXPIRY DATE" "STATUS" "UID"
+    printf "%-20s %-18s %-12s %-8s\n" "--------" "-----------" "------" "---"
 
     local user_count=0
     while IFS=: read -r username _ uid _ _ _ shell _; do
-        # Filter: UID >= 1000, exclude nobody, exclude shell /usr/sbin/nologin default users
+        # Filter: UID >= 1000, exclude nobody
         if [ "$uid" -ge 1000 ] 2>/dev/null && [ "$username" != "nobody" ]; then
-            local exp status
+            local exp status_raw status_text
             exp=$(chage -l "$username" 2>/dev/null | grep "Account expires" | awk -F": " '{print $2}')
             [ -z "$exp" ] && exp="never"
-            status=$(passwd -S "$username" 2>/dev/null | awk '{print $2}')
-            if [ "$status" = "L" ]; then
-                status="${RED}LOCKED${NC}"
-            elif [ "$status" = "P" ]; then
-                status="${GREEN}ACTIVE${NC}"
+            status_raw=$(passwd -S "$username" 2>/dev/null | awk '{print $2}')
+            # FIX2: Pakai plain text untuk STATUS column (no ANSI escape codes)
+            # supaya printf width calculation benar (TIDAK menghitung escape codes)
+            # Lesson v6 FIX2 dipertahankan: hindari over-fix
+            if [ "$status_raw" = "L" ]; then
+                status_text="LOCKED"
+            elif [ "$status_raw" = "P" ]; then
+                status_text="ACTIVE"
             else
-                status="${YELLOW}$status${NC}"
+                status_text="$status_raw"
             fi
-            printf "%-20s %-15s %-15s %-12s\n" "$username" "$exp" "$status" "$uid"
+            printf "%-20s %-18s %-12s %-8s\n" "$username" "$exp" "$status_text" "$uid"
             user_count=$((user_count + 1))
         fi
     done < /etc/passwd
@@ -484,18 +513,17 @@ feat5_history_1h() {
     fi
 
     # Coba journalctl dulu (lebih reliable di Ubuntu 20.04)
-    # FIX1 (v12-Sesi-2.3): Rewrite awk tanpa match() 3-arg (gawk extension).
-    # Pakai index() + split() yang support di mawk dan gawk.
+    # FIX2 (v12-Sesi-2.3): Rewrite awk menggunakan sprintf("%c", 39) untuk single quote.
+    # Alasan: Pattern '"'"' quoting kompleks rentan syntax error di mawk version beda.
+    # sprintf("%c", 39) = single quote character, menghindari shell quoting hell.
     local events
     events=$(journalctl --since "1 hour ago" --no-pager -o short-iso 2>/dev/null | \
         grep -E "Accepted password|Password auth succeeded" | \
-        awk '{
-            # Format: TIMESTAMP HOSTNAME SERVICE[PID]: MESSAGE
+        awk '
+        BEGIN { sq = sprintf("%c", 39) }
+        {
             timestamp = $1 " " $2
-            # Cek pola sshd: "Accepted password for USERNAME from IP port N ssh2"
             if (index($0, "Accepted password for") > 0) {
-                # Split by "for " — second part = "username from ip port N ssh2"
-                # atau "invalid user username from ip port N ssh2"
                 n = split($0, a, "for ")
                 rest = a[2]
                 m = split(rest, b, " ")
@@ -506,18 +534,15 @@ feat5_history_1h() {
                     user = b[1]
                     ip = b[3]
                 }
-                # Detect service
                 if (index($0, "sshd") > 0) service = "SSH"
                 else if (index($0, "dropbear") > 0) service = "Dropbear"
                 else service = "?"
                 printf "%s|%s|%s|%s\n", timestamp, user, ip, service
             }
-            # Cek pola dropbear: "Password auth succeeded for 'USERNAME' from IP:port"
-            else if (index($0, "Password auth succeeded for '"'"'") > 0) {
-                n = split($0, a, "for '"'"'")
-                rest = a[2]  # rest = "USERNAME' from IP:port"
-                # Split by "' from " — splits into [USERNAME, IP:port]
-                m = split(rest, b, "'"'"' from ")
+            else if (index($0, "Password auth succeeded for " sq) > 0) {
+                n = split($0, a, "for " sq)
+                rest = a[2]
+                m = split(rest, b, sq " from ")
                 user = b[1]
                 ip = b[2]
                 sub(/:[0-9]+$/, "", ip)
@@ -525,8 +550,13 @@ feat5_history_1h() {
             }
         }')
 
+    # FIX2: gunakan wc -l (BUKAN grep -c | || echo 0)
+    # Alasan: grep -c returns '0' + exit 1, lalu || echo 0 fires,
+    # hasil '0\n0' multiline → error [ "$count" -eq 0 ] integer expression expected.
+    # wc -l selalu return single integer (0 untuk empty input).
     local event_count
-    event_count=$(echo "$events" | grep -c "|" 2>/dev/null || echo 0)
+    event_count=$(printf "%s\n" "$events" | grep "|" | wc -l)
+    [ -z "$events" ] && event_count=0
 
     if [ "$event_count" -eq 0 ]; then
         echo -e "${YELLOW}[i] Tidak ada event login SSH/Dropbear dalam 1 jam terakhir.${NC}"
@@ -534,14 +564,14 @@ feat5_history_1h() {
         echo ""
         echo -e "${CYAN}[i] Mencoba fallback ke /var/log/auth.log...${NC}"
         # Fallback ke auth.log
-        # FIX1 (v12-Sesi-2.3): Rewrite awk tanpa match() 3-arg.
+        # FIX2 (v12-Sesi-2.3): Rewrite awk pakai sprintf("%c", 39) untuk single quote.
         if [ -f /var/log/auth.log ]; then
-            events=$(awk '{
-                # Format auth.log: "Mon DD HH:MM:SS HOSTNAME SERVICE[PID]: MESSAGE"
+            events=$(awk '
+            BEGIN { sq = sprintf("%c", 39) }
+            {
                 month = $1
                 day = $2
                 time = $3
-                # Cek pola sshd
                 if (index($0, "Accepted password for") > 0) {
                     n = split($0, a, "for ")
                     rest = a[2]
@@ -558,18 +588,18 @@ feat5_history_1h() {
                     else service = "?"
                     printf "%s %s %s|%s|%s|%s\n", month, day, time, user, ip, service
                 }
-                # Cek pola dropbear
-                else if (index($0, "Password auth succeeded for '"'"'") > 0) {
-                    n = split($0, a, "for '"'"'")
+                else if (index($0, "Password auth succeeded for " sq) > 0) {
+                    n = split($0, a, "for " sq)
                     rest = a[2]
-                    m = split(rest, b, "'"'"' from ")
+                    m = split(rest, b, sq " from ")
                     user = b[1]
                     ip = b[2]
                     sub(/:[0-9]+$/, "", ip)
                     printf "%s %s %s|%s|%s|%s\n", month, day, time, user, ip, "Dropbear"
                 }
             }' /var/log/auth.log 2>/dev/null)
-            event_count=$(echo "$events" | grep -c "|" 2>/dev/null || echo 0)
+            event_count=$(printf "%s\n" "$events" | grep "|" | wc -l)
+            [ -z "$events" ] && event_count=0
         fi
 
         if [ "$event_count" -eq 0 ]; then
