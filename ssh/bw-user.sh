@@ -1,26 +1,38 @@
 #!/bin/bash
 # ============================================================================
 # Script  : bw-user.sh
-# Version : 1.0 (Sesi 2.5-A - v16)
-# Purpose : Bandwidth per-user untuk SSH DIRECT (port 22) via iptables
-#           accounting + Pattern 19 mapping IP→user.
-#           OPSI A dari investigasi UID traffic VPS (5 PERINTAH):
-#             - Port 22 (SSH direct): peer IP = IP user asli → AKURAT
-#             - Port 443/8880/109/143 (tunneling): peer = Cloudfront/loopback
-#               → TIDAK dihitung di sesi ini (defer OPSI B kalau perlu)
-# Setup   : 1. Run `bw-user --setup` (1x) → create chain + hook + cron
-#           2. Cron tiap 1 menit auto-snapshot counter
+# Version : 2.0 (Sesi 2.5-B - v17)
+# Purpose : Bandwidth per-user via /proc/<pid>/io untuk SEMUA path tunneling
+#           (SSH direct port 22 + Dropbear child port 109/143).
+#           Cloudfront/WS-TLS/WS-NonTLS user otomatis ter-cover karena
+#           trafficnya di-handle oleh Dropbear child.
+#
+#           Approach: snapshot /proc/<pid>/io (rchar/wchar) per-PID setiap 1 menit
+#           via cron, calculate delta vs last snapshot, accumulate per-user ke
+#           hourly file. Periodik view: Live / Per Jam / Hari Ini / 7 Hari / 30 Hari.
+#
+#           Mengikuti pola script Xray (statsquery + snapshots + awk combine),
+#           diadaptasi untuk SSH/Dropbear dengan /proc/<pid>/io + Pattern 19.
+#
+# Setup   : 1. Run `bw-user --setup` (1x) → create dirs + install cron
+#           2. Cron tiap 1 menit auto-snapshot + accumulate
 #           3. Run `bw-user` interactive atau `bw-user --display` CLI
+#
 # Source  : Original HAXOR wrapper
-#           - Pattern 19 v13 (Hybrid 4-layer resolver) untuk mapping IP→user
+#           - Pattern 19 v13 (Hybrid 4-layer resolver) untuk mapping PID→user
 #           - Pattern 24 v14 (Global journal cache) untuk performance
-#           - Adaptasi dari pantau.sh v1.1 + tendang-safe.sh v1.2
+#           - Pattern 28 v16 (resolve_user_from_ip) untuk fallback (legacy)
+#           - Pola snapshot + periodik view diadaptasi dari script Xray (user ref)
 # Brand   : HAXOR + Tagline "DEKENG ANE BIAK BELITONG"
 # Usage   : bw-user                          (interactive menu, recommended)
-#           bw-user --display                (CLI: tampilkan tabel bandwidth)
-#           bw-user --setup                  (CLI: setup chain + cron)
-#           bw-user --snap                   (CLI: cron job - snapshot counter)
-#           bw-user --reset                  (CLI: reset counter + accumulation)
+#           bw-user --display                (CLI: tampilkan tabel live)
+#           bw-user --hourly                 (CLI: tampilkan 24 jam terakhir)
+#           bw-user --today                  (CLI: total per user hari ini)
+#           bw-user --7d                     (CLI: 7 hari terakhir)
+#           bw-user --30d                    (CLI: 30 hari terakhir)
+#           bw-user --setup                  (CLI: setup dirs + cron)
+#           bw-user --snap                    (CLI: cron job - snapshot + accumulate)
+#           bw-user --reset                  (CLI: clear all data)
 #           bw-user --help                   (CLI: tampilkan help)
 #           bw-user --version                 (CLI: tampilkan versi)
 # ============================================================================
@@ -44,19 +56,22 @@ BG_CYAN=$'\033[48;5;24m'
 BG_TEAL=$'\033[48;5;30m'
 
 # --- Constants ---
-SCRIPT_VERSION="1.0"
+SCRIPT_VERSION="2.0"
 SSH_PORT="22"
-CHAIN_IN="bw_user_in"
-CHAIN_OUT="bw_user_out"
+DROPBEAR_PORTS="109 143"
 BANDWIDTH_DIR="/var/log/bw-user"
-SNAP_FILE="${BANDWIDTH_DIR}/last-snap.log"
-ACCUM_DIR="${BANDWIDTH_DIR}/accum"
+SNAP_DIR="${BANDWIDTH_DIR}/snapshots"
+HOURLY_DIR="${BANDWIDTH_DIR}/accum/hourly"
+DAILY_DIR="${BANDWIDTH_DIR}/accum/daily"
+LAST_SNAP="${BANDWIDTH_DIR}/last-snap.log"
 CRON_FILE="/etc/cron.d/bw-user"
 LOG_WINDOW="24 hours ago"
+SNAPSHOT_RETAIN_DAYS=7
+HOURLY_RETAIN_DAYS=30
+DAILY_RETAIN_DAYS=90
 
 # System daemon users yang TIDAK dihitung (filter dari display)
 # FIX1-B v16: Hapus "root" dari filter — root adalah admin yang valid, bandwidth root harus dihitung
-# Filter hanya untuk system daemon (sslh, daemon, nobody, dll), BUKAN untuk root user login
 SYSTEM_USERS_FILTER="sslh daemon nobody systemd+ sshd www-data message+ syslog usbmux dnsmasq"
 
 # --- FIX2 v14: Global journal cache (fetched ONCE per script run) ---
@@ -142,14 +157,14 @@ pause() {
 }
 
 # --- Helper: show header banner ---
-# Branding HAXOR + tagline BELITONG (lokasi #10 - was 9 di tendang-safe v1.2)
+# Branding HAXOR + tagline BELITONG (lokasi #10 - retained dari v1.0-FIX2)
 show_header() {
     clear
     echo -e "${BG_CYAN}                                                  ${NC}"
     echo -e "${BG_CYAN}  BANDWIDTH PER-USER - HAXOR TUNNELING             ${NC}"
     echo -e "${BG_TEAL}  DEKENG ANE BIAK BELITONG                         ${NC}"
     echo -e "${BG_CYAN}                                                  ${NC}"
-    echo -e "${GRAY}  SSH Direct (port 22) only - iptables accounting${NC}"
+    echo -e "${GRAY}  /proc/<pid>/io - Dropbear child + sshd PID tracking${NC}"
     echo
 }
 
@@ -211,7 +226,7 @@ resolve_user_from_pid() {
             elif [[ $log_line =~ Accepted\ password\ for\ ([a-zA-Z0-9_.-]+)\ from ]]; then
                 log_user="${BASH_REMATCH[1]}"
             fi
-            if [ -n "$log_user" ] && [ "$log_user" != "root" ]; then
+            if [ -n "$log_user" ]; then
                 echo "$log_user"
                 return
             fi
@@ -230,7 +245,7 @@ resolve_user_from_pid() {
             elif [[ $log_line2 =~ Accepted\ password\ for\ ([a-zA-Z0-9_.-]+)\ from ]]; then
                 log_user="${BASH_REMATCH[1]}"
             fi
-            if [ -n "$log_user" ] && [ "$log_user" != "root" ]; then
+            if [ -n "$log_user" ]; then
                 echo "$log_user"
                 return
             fi
@@ -243,7 +258,7 @@ resolve_user_from_pid() {
     if [ -n "$args" ]; then
         if [[ $args =~ ^sshd:\ ([a-zA-Z0-9_.-]+) ]]; then
             user="${BASH_REMATCH[1]}"
-            if [ "$user" != "root" ] && [ "$user" != "system" ]; then
+            if [ "$user" != "system" ]; then
                 echo "$user"
                 return
             fi
@@ -274,19 +289,21 @@ resolve_user_from_pid() {
     echo "-"
 }
 
+# --- Helper: cek apakah username adalah system daemon (skip dari display) ---
+is_system_user() {
+    local user=$1
+    case " $SYSTEM_USERS_FILTER " in
+        *" $user "*) return 0 ;;
+    esac
+    return 1
+}
+
 # ============================================================================
-# Pattern 28 (NEW v16-Sesi-2.5-A-FIX2): Resolve username by IP from auth.log
+# Pattern 28 (v16): Resolve username by IP from auth.log
 # Used when PID NOT found in current `ss` (IP disconnected/historical/scanner)
-#
-# Logic:
-#   1. Search journalctl cache for "Accepted password for USER from IP"
-#   2. Fallback to /var/log/auth.log cache
-#   3. Extract username from most recent matching entry
-#
-# Limitation:
-#   - Returns "?" untuk failed SSH attempts (no "Accepted password" log)
-#   - Returns "?" untuk scanners (no auth log entry)
-#   - Only works for IPs yang pernah auth sukses dalam 24 jam terakhir
+# NOTE: Di v2.0, Pattern 28 RETAINED untuk backward compatibility, TAPI
+#       approach utama sekarang /proc/<pid>/io tidak butuh resolve by IP
+#       (karena PID-based tracking, BUKAN IP-based).
 # ============================================================================
 resolve_user_from_ip() {
     local ip="$1"
@@ -299,7 +316,6 @@ resolve_user_from_ip() {
     local username=""
 
     # Pattern A: SSH direct port 22 - "Accepted password for USER from IP"
-    # Dropbear via WS TIDAK relevant di bw-user (hanya port 22 SSH direct)
     if [ -n "$JOURNAL_LOG_CACHE" ]; then
         local match
         match=$(printf '%s\n' "$JOURNAL_LOG_CACHE" | grep -F "from $ip" | grep -E "Accepted (password|publickey) for" | tail -1)
@@ -328,18 +344,22 @@ resolve_user_from_ip() {
     [ -n "$username" ] && echo "$username" || echo "?"
 }
 
-# --- Helper: get active SSH direct connections (port 22 only) ---
-# Output: baris "ip|pid" per koneksi SSH direct (peer IP public, bukan protected)
-# Adaptasi dari get_active_connections pantau.sh v1.1 (filter port 22 only)
-get_active_ssh_connections() {
+# ============================================================================
+# NEW v2.0: get_active_tunneling_pids
+# Scan ss untuk Dropbear child (port 109/143) + sshd (port 22) PID yang established
+# Output: list of "pid" per line (filtered: skip loopback, VPS IP, protected IP)
+# Adaptasi dari get_active_connections pantau.sh + tendang-safe.sh
+# ============================================================================
+get_active_tunneling_pids() {
     ss -tnpH state established 2>/dev/null | while IFS= read -r line; do
         [ -z "$line" ] && continue
 
-        # Extract PID via bash regex
-        local pid="?"
+        # Extract PID via bash regex (Pattern 16 v12)
+        local pid=""
         if [[ $line =~ pid=([0-9]+) ]]; then
             pid="${BASH_REMATCH[1]}"
         fi
+        [ -z "$pid" ] && continue
 
         # Extract address tokens (Local + Peer)
         local addr_list
@@ -354,96 +374,530 @@ get_active_ssh_connections() {
         local local_addr peer_addr
         local_addr=$(printf '%s\n' "$addr_list" | sed -n '1p')
         peer_addr=$(printf '%s\n' "$addr_list" | sed -n '2p')
-        [ -z "$local_addr" ] || [ -z "$peer_addr" ] && continue
+        [ -z "$local_addr" ] && continue
 
+        # Extract local port
         local local_port="${local_addr##*:}"
         local_port="${local_port%%[^0-9]*}"
 
-        # FILTER: hanya port 22 (SSH direct)
-        [ "$local_port" != "$SSH_PORT" ] && continue
+        # FILTER: hanya port yang relevan (Dropbear 109/143 + sshd 22)
+        local is_target=0
+        case "$local_port" in
+            22|109|143) is_target=1 ;;
+        esac
+        [ "$is_target" -eq 0 ] && continue
 
-        local peer_ip="${peer_addr%:*}"
-        peer_ip="${peer_ip#[}"
-        peer_ip="${peer_ip%]}"
+        # Extract peer IP (untuk filter loopback/VPS IP)
+        local peer_ip=""
+        if [ -n "$peer_addr" ]; then
+            peer_ip="${peer_addr%:*}"
+            peer_ip="${peer_ip#[}"
+            peer_ip="${peer_ip%]}"
+        fi
 
         # Skip protected IP (loopback, VPS IP, private range)
         is_protected_ip "$peer_ip" && continue
 
-        printf '%s|%s\n' "$peer_ip" "$pid"
+        echo "$pid"
     done
 }
 
-# --- Helper: cek apakah chain bw_user_in/bw_user_out sudah ada ---
-chain_exists() {
-    local chain=$1
-    iptables -n -L "$chain" >/dev/null 2>&1
-}
+# ============================================================================
+# NEW v2.0: capture_current_snapshot
+# Capture /proc/<pid>/io (rchar, wchar) untuk semua active tunneling PID
+# Resolve username via Pattern 19
+# Output: list "pid:user:rchar:wchar" per line (sorted by rchar desc)
+# ============================================================================
+capture_current_snapshot() {
+    local pid user rchar wchar
+    while IFS= read -r pid; do
+        [ -z "$pid" ] && continue
 
-# --- Helper: cek apakah rule sudah ada di chain ---
-rule_exists_in_chain() {
-    local chain=$1
-    local direction=$2  # "src" atau "dst"
-    local ip=$3
-    if [ "$direction" = "src" ]; then
-        iptables -C "$chain" -s "$ip" -j RETURN 2>/dev/null
-    else
-        iptables -C "$chain" -d "$ip" -j RETURN 2>/dev/null
-    fi
-}
+        # Read /proc/<pid>/io
+        if [ ! -r "/proc/$pid/io" ]; then continue; fi
+        rchar=$(awk '/^rchar:/ {print $2}' "/proc/$pid/io" 2>/dev/null)
+        wchar=$(awk '/^wchar:/ {print $2}' "/proc/$pid/io" 2>/dev/null)
+        [ -z "$rchar" ] && rchar=0
+        [ -z "$wchar" ] && wchar=0
 
-# --- Helper: install cron file ---
-install_cron() {
-    cat > "$CRON_FILE" <<EOF
-# Autogenerated by bw-user v${SCRIPT_VERSION} (HAXOR Panel Tunneling)
-# Cron job: snapshot iptables counter per-IP untuk SSH direct (port 22)
-# Schedule: every 1 minute
-* * * * * root /usr/bin/bw-user --snap >/dev/null 2>&1
-EOF
-    chmod 644 "$CRON_FILE"
+        # Resolve user via Pattern 19
+        user=$(resolve_user_from_pid "$pid")
+        [ -z "$user" ] && user="?"
+
+        printf '%s:%s:%s:%s\n' "$pid" "$user" "$rchar" "$wchar"
+    done < <(get_active_tunneling_pids)
 }
 
 # ============================================================================
-# Command: --setup
-# Setup chain iptables + hook rules port 22 + install cron
+# NEW v2.0: cmd_snap (cron job logic)
+# 1. Capture current snapshot (all PID + rchar/wchar + user)
+# 2. Save to snapshots/YYYY-MM-DD-HH-MM.log
+# 3. Load last-snap.log
+# 4. For each PID in current:
+#    - Calculate delta rchar/wchar vs last-snap (handle PID reuse via user check)
+#    - If user != "?" and not system: add delta to hourly file (today's hour)
+# 5. Save current snapshot as last-snap.log
+# 6. Cleanup old snapshots (>7 days) + hourly (>30 days) + daily (>90 days)
+# ============================================================================
+cmd_snap() {
+    # Ensure dirs exist (auto-recover kalau VPS reboot)
+    mkdir -p "$SNAP_DIR" "$HOURLY_DIR" "$DAILY_DIR" 2>/dev/null
+
+    local TS_NOW=$(date +%s)
+    local SNAP_DATE=$(date +%Y-%m-%d)
+    local SNAP_TIME=$(date +%Y-%m-%d-%H-%M)
+    local SNAP_HOUR=$(date +%Y-%m-%d-%H)
+    local HOURLY_FILE="${HOURLY_DIR}/${SNAP_HOUR}.log"
+    local SNAP_FILE="${SNAP_DIR}/${SNAP_TIME}.log"
+
+    # Capture current snapshot
+    local CURRENT_SNAP
+    CURRENT_SNAP=$(capture_current_snapshot)
+
+    # Save current snapshot to file (with header)
+    {
+        echo "# Snapshot: ${SNAP_TIME} (epoch: ${TS_NOW})"
+        echo "# Format: pid:user:rchar:wchar"
+        if [ -n "$CURRENT_SNAP" ]; then
+            printf '%s\n' "$CURRENT_SNAP"
+        fi
+    } > "$SNAP_FILE"
+
+    # Load last snapshot (skip header lines starting with #)
+    local LAST_SNAP_DATA=""
+    if [ -f "$LAST_SNAP" ]; then
+        LAST_SNAP_DATA=$(grep -v '^#' "$LAST_SNAP" 2>/dev/null)
+    fi
+
+    # Build associative array of last snap: pid → "user:rchar:wchar"
+    declare -A LAST_SNAP_MAP
+    if [ -n "$LAST_SNAP_DATA" ]; then
+        while IFS=: read -r l_pid l_user l_rchar l_wchar; do
+            [ -z "$l_pid" ] && continue
+            LAST_SNAP_MAP["$l_pid"]="${l_user}:${l_rchar}:${l_wchar}"
+        done <<< "$LAST_SNAP_DATA"
+    fi
+
+    # Calculate deltas per PID, accumulate per user
+    local delta_rchar delta_wchar prev_user prev_rchar prev_wchar
+    local user_pid_entry
+    declare -A USER_DELTA_UP
+    declare -A USER_DELTA_DOWN
+
+    if [ -n "$CURRENT_SNAP" ]; then
+        while IFS=: read -r pid user rchar wchar; do
+            [ -z "$pid" ] && continue
+
+            # Skip if user is "?" or system daemon
+            if [ "$user" = "?" ] || [ "$user" = "-" ]; then
+                continue
+            fi
+            if is_system_user "$user"; then
+                continue
+            fi
+
+            # Calculate delta vs last snap
+            if [ -n "${LAST_SNAP_MAP[$pid]+x}" ]; then
+                # PID exists in last snap
+                user_pid_entry="${LAST_SNAP_MAP[$pid]}"
+                prev_user="${user_pid_entry%%:*}"
+                local rest="${user_pid_entry#*:}"
+                prev_rchar="${rest%%:*}"
+                prev_wchar="${rest##*:}"
+
+                if [ "$prev_user" = "$user" ]; then
+                    # Same user, calculate delta
+                    if [ "$rchar" -ge "$prev_rchar" ] 2>/dev/null; then
+                        delta_rchar=$((rchar - prev_rchar))
+                    else
+                        # Counter reset (impossible normally, but defensive)
+                        delta_rchar="$rchar"
+                    fi
+                    if [ "$wchar" -ge "$prev_wchar" ] 2>/dev/null; then
+                        delta_wchar=$((wchar - prev_wchar))
+                    else
+                        delta_wchar="$wchar"
+                    fi
+                else
+                    # PID reuse (different user) — treat as new, delta = current
+                    delta_rchar="$rchar"
+                    delta_wchar="$wchar"
+                fi
+            else
+                # New PID — delta = current (assume start from 0)
+                delta_rchar="$rchar"
+                delta_wchar="$wchar"
+            fi
+
+            # Accumulate per user
+            USER_DELTA_UP["$user"]=$((${USER_DELTA_UP[$user]:-0} + delta_rchar))
+            USER_DELTA_DOWN["$user"]=$((${USER_DELTA_DOWN[$user]:-0} + delta_wchar))
+        done <<< "$CURRENT_SNAP"
+    fi
+
+    # Update hourly file (per-user accumulated deltas for this hour)
+    # Format: user:up_bytes:down_bytes:total_bytes
+    if [ ${#USER_DELTA_UP[@]} -gt 0 ]; then
+        # Merge with existing hourly file
+        local TMP_HOURLY=$(mktemp)
+        if [ -f "$HOURLY_FILE" ]; then
+            cp "$HOURLY_FILE" "$TMP_HOURLY"
+        fi
+
+        # Add deltas to existing values (or create new entries)
+        for user in "${!USER_DELTA_UP[@]}"; do
+            local du="${USER_DELTA_UP[$user]}"
+            local dd="${USER_DELTA_DOWN[$user]}"
+            local tmp_new=$(mktemp)
+
+            # FIX: -v OFS=: untuk output field separator konsisten dengan input
+            # (kalau tidak set, awk default OFS=spasi → format jadi rusak)
+            awk -F: -v OFS=: -v u="$user" -v du="$du" -v dd="$dd" '
+            BEGIN { found=0 }
+            $1 == u {
+                $2 = $2 + du; $3 = $3 + dd; $4 = $2 + $3;
+                print;
+                found=1;
+                next
+            }
+            { print }
+            END { if (!found) printf "%s:%d:%d:%d\n", u, du, dd, du+dd }
+            ' "$TMP_HOURLY" > "$tmp_new"
+            mv "$tmp_new" "$TMP_HOURLY"
+        done
+
+        mv "$TMP_HOURLY" "$HOURLY_FILE"
+    fi
+
+    # Save current snapshot as last-snap.log (for next run delta calc)
+    cp "$SNAP_FILE" "$LAST_SNAP"
+
+    # Cleanup old files
+    find "$SNAP_DIR" -name '*.log' -mtime +$SNAPSHOT_RETAIN_DAYS -delete 2>/dev/null
+    find "$HOURLY_DIR" -name '*.log' -mtime +$HOURLY_RETAIN_DAYS -delete 2>/dev/null
+    find "$DAILY_DIR" -name '*.log' -mtime +$DAILY_RETAIN_DAYS -delete 2>/dev/null
+
+    return 0
+}
+
+# ============================================================================
+# NEW v2.0: cmd_display_live
+# Show active users + current rchar/wchar (current values, BUKAN delta)
+# Format: USERNAME | PID | UP (rchar) | DOWN (wchar) | TOTAL
+# Skip user "?" dan system daemon
+# ============================================================================
+cmd_display_live() {
+    show_header
+    echo -e "${CYAN}=== BANDWIDTH PER-USER (LIVE - CURRENT SESSION) ===${NC}"
+    echo -e "${GRAY}Update: snapshot real-time dari /proc/<pid>/io${NC}"
+    echo
+
+    local CURRENT_SNAP
+    CURRENT_SNAP=$(capture_current_snapshot)
+
+    if [ -z "$CURRENT_SNAP" ]; then
+        echo -e "${YELLOW}Tidak ada koneksi tunneling aktif saat ini.${NC}"
+        echo -e "${GRAY}(Dropbear port 109/143 + sshd port 22)${NC}"
+        pause
+        return 0
+    fi
+
+    # Header
+    echo -e "${YELLOW}USERNAME         PID        UP (rchar)     DOWN (wchar)   TOTAL          ${NC}"
+    echo -e "${DGRAY}─────────────    ─────────  ──────────     ──────────     ──────────     ${NC}"
+
+    local total_up=0 total_down=0 user_count=0
+    local pid user rchar wchar total
+    local displayed_lines=""
+
+    # Sort by rchar desc, then filter "?"
+    local SORTED_SNAP
+    SORTED_SNAP=$(printf '%s\n' "$CURRENT_SNAP" | sort -t: -k3 -n -r)
+
+    while IFS=: read -r pid user rchar wchar; do
+        [ -z "$pid" ] && continue
+
+        # Skip if user is "?" or system daemon
+        if [ "$user" = "?" ] || [ "$user" = "-" ]; then
+            continue
+        fi
+        if is_system_user "$user"; then
+            continue
+        fi
+
+        total=$((rchar + wchar))
+        printf "%-16s %-10s %-14s %-14s %-14s\n" \
+            "$user" "$pid" "$(format_bytes $rchar)" "$(format_bytes $wchar)" "$(format_bytes $total)"
+
+        total_up=$((total_up + rchar))
+        total_down=$((total_down + wchar))
+        user_count=$((user_count + 1))
+    done <<< "$SORTED_SNAP"
+
+    echo -e "${DGRAY}─────────────    ─────────  ──────────     ──────────     ──────────     ${NC}"
+    local total_all=$((total_up + total_down))
+    printf "${YELLOW}%-16s %-10s %-14s %-14s %-14s${NC}\n" \
+        "TOTAL" "($user_count)" "$(format_bytes $total_up)" "$(format_bytes $total_down)" "$(format_bytes $total_all)"
+
+    echo
+    echo -e "${GRAY}Limitation:${NC}"
+    echo -e "  ${GRAY}- Hanya tampilkan user aktif dengan username ter-resolve (Pattern 19)${NC}"
+    echo -e "  ${GRAY}- User '?' (scanner/failed auth) di-skip dari display${NC}"
+    echo -e "  ${GRAY}- rchar = bytes di-read process (proxy untuk upload user)${NC}"
+    echo -e "  ${GRAY}- wchar = bytes di-write process (proxy untuk download user)${NC}"
+    echo -e "  ${GRAY}- Counter di-reset saat PID exit (user disconnect)${NC}"
+    pause
+}
+
+# ============================================================================
+# NEW v2.0: cmd_display_hourly
+# Show last 24 hours, each row = 1 hour
+# Columns: HOUR | TOTAL UP | TOTAL DOWN | TOTAL | TOP USER (with their bytes)
+# Data source: accum/hourly/*.log (sum all entries per hour)
+# ============================================================================
+cmd_display_hourly() {
+    show_header
+    echo -e "${CYAN}=== BANDWIDTH PER JAM (24 JAM TERAKHIR) ===${NC}"
+    echo
+
+    echo -e "${YELLOW}HOUR                  TOTAL UP      TOTAL DOWN    TOTAL         TOP USER${NC}"
+    echo -e "${DGRAY}──────────────────    ──────────    ──────────    ──────────    ──────────────${NC}"
+
+    local total_up=0 total_down=0
+    local now_epoch=$(date +%s)
+    local hour_epoch
+
+    for i in $(seq 23 -1 0); do
+        hour_epoch=$((now_epoch - i * 3600))
+        # Round to start of hour
+        local hour_start=$((hour_epoch - (hour_epoch % 3600)))
+        local hour_label=$(date -d "@$hour_start" +'%Y-%m-%d %H:00')
+        local hour_file=$(date -d "@$hour_start" +'%Y-%m-%d-%H')
+        local hourly_path="${HOURLY_DIR}/${hour_file}.log"
+
+        local h_up=0 h_down=0 h_total=0
+        local top_user="" top_user_total=0
+
+        if [ -f "$hourly_path" ]; then
+            while IFS=: read -r user up down total; do
+                [ -z "$user" ] && continue
+                up=${up:-0}; down=${down:-0}; total=${total:-0}
+                h_up=$((h_up + up))
+                h_down=$((h_down + down))
+                h_total=$((h_total + total))
+                if [ "$total" -gt "$top_user_total" ] 2>/dev/null; then
+                    top_user_total="$total"
+                    top_user="$user"
+                fi
+            done < "$hourly_path"
+        fi
+
+        local top_user_display="-"
+        if [ -n "$top_user" ]; then
+            top_user_display="${top_user} ($(format_bytes $top_user_total))"
+        fi
+
+        printf "%-20s  %-12s  %-12s  %-12s  %s\n" \
+            "$hour_label" \
+            "$(format_bytes $h_up)" \
+            "$(format_bytes $h_down)" \
+            "$(format_bytes $h_total)" \
+            "$top_user_display"
+
+        total_up=$((total_up + h_up))
+        total_down=$((total_down + h_down))
+    done
+
+    local total_all=$((total_up + total_down))
+    echo -e "${DGRAY}──────────────────    ──────────    ──────────    ──────────    ──────────────${NC}"
+    printf "${YELLOW}%-20s  %-12s  %-12s  %-12s${NC}\n" \
+        "TOTAL (24 jam)" \
+        "$(format_bytes $total_up)" \
+        "$(format_bytes $total_down)" \
+        "$(format_bytes $total_all)"
+
+    echo
+    echo -e "${GRAY}Data source: ${HOURLY_DIR}/ (cron accumulate tiap 1 menit)${NC}"
+    echo -e "${GRAY}Retain: ${HOURLY_RETAIN_DAYS} hari. Hour kosong = belum ada traffic jam itu.${NC}"
+    pause
+}
+
+# ============================================================================
+# NEW v2.0: cmd_display_today
+# Total per user for today (sum all hourly files for today)
+# Format: USERNAME | UPLOAD | DOWNLOAD | TOTAL (sorted by total desc)
+# ============================================================================
+cmd_display_today() {
+    show_header
+    echo -e "${CYAN}=== BANDWIDTH HARI INI (PER USER) ===${NC}"
+    echo -e "${GRAY}Tanggal: $(date +'%Y-%m-%d')${NC}"
+    echo
+
+    local today=$(date +'%Y-%m-%d')
+    local tmp_combined=$(mktemp)
+
+    # Combine all hourly files for today
+    for hourly_path in "${HOURLY_DIR}/${today}"-*.log; do
+        [ -f "$hourly_path" ] || continue
+        grep -v '^#' "$hourly_path" >> "$tmp_combined"
+    done
+
+    if [ ! -s "$tmp_combined" ]; then
+        echo -e "${YELLOW}Belum ada data bandwidth untuk hari ini.${NC}"
+        echo -e "${GRAY}Tunggu 1-2 menit agar cron mencatat aktivitas.${NC}"
+        rm -f "$tmp_combined"
+        pause
+        return 0
+    fi
+
+    # Aggregate per user (sum up:up:down:total)
+    awk -F: '
+    {
+        up[$1] += $2
+        dn[$1] += $3
+        tt[$1] += $4
+    }
+    END {
+        for (u in up) printf "%s:%d:%d:%d\n", u, up[u], dn[u], up[u]+dn[u]
+    }
+    ' "$tmp_combined" | sort -t: -k4 -n -r > "${tmp_combined}.sorted"
+
+    echo -e "${YELLOW}USERNAME         UPLOAD        DOWNLOAD      TOTAL         ${NC}"
+    echo -e "${DGRAY}─────────────    ──────────    ──────────    ──────────   ${NC}"
+
+    local total_up=0 total_down=0 user_count=0
+    while IFS=: read -r user up down total; do
+        [ -z "$user" ] && continue
+        printf "%-16s %-13s %-13s %-13s\n" \
+            "$user" "$(format_bytes $up)" "$(format_bytes $down)" "$(format_bytes $total)"
+        total_up=$((total_up + up))
+        total_down=$((total_down + down))
+        user_count=$((user_count + 1))
+    done < "${tmp_combined}.sorted"
+
+    echo -e "${DGRAY}─────────────    ──────────    ──────────    ──────────   ${NC}"
+    local total_all=$((total_up + total_down))
+    printf "${YELLOW}%-16s %-13s %-13s %-13s${NC}\n" \
+        "TOTAL" "($user_count user)" \
+        "$(format_bytes $total_up)" "$(format_bytes $total_down)" "$(format_bytes $total_all)"
+
+    rm -f "$tmp_combined" "${tmp_combined}.sorted"
+    pause
+}
+
+# ============================================================================
+# NEW v2.0: cmd_display_range (generic untuk 7d/30d)
+# Combine hourly files for last N days, sum per user, display
+# ============================================================================
+cmd_display_range() {
+    local DAYS=$1
+    local title=$2
+
+    show_header
+    echo -e "${CYAN}=== ${title} ===${NC}"
+    echo
+
+    local tmp_combined=$(mktemp)
+    local now_epoch=$(date +%s)
+    local day_epoch day_date
+
+    for i in $(seq 0 $((DAYS - 1))); do
+        day_epoch=$((now_epoch - i * 86400))
+        day_date=$(date -d "@$day_epoch" +'%Y-%m-%d')
+        for hourly_path in "${HOURLY_DIR}/${day_date}"-*.log; do
+            [ -f "$hourly_path" ] || continue
+            grep -v '^#' "$hourly_path" >> "$tmp_combined"
+        done
+    done
+
+    if [ ! -s "$tmp_combined" ]; then
+        echo -e "${YELLOW}Belum ada data bandwidth untuk ${DAYS} hari terakhir.${NC}"
+        echo -e "${GRAY}Tunggu beberapa menit agar cron mencatat aktivitas.${NC}"
+        rm -f "$tmp_combined"
+        pause
+        return 0
+    fi
+
+    # Aggregate per user
+    awk -F: '
+    {
+        up[$1] += $2
+        dn[$1] += $3
+        tt[$1] += $4
+    }
+    END {
+        for (u in up) printf "%s:%d:%d:%d\n", u, up[u], dn[u], up[u]+dn[u]
+    }
+    ' "$tmp_combined" | sort -t: -k4 -n -r > "${tmp_combined}.sorted"
+
+    echo -e "${YELLOW}USERNAME         UPLOAD        DOWNLOAD      TOTAL         ${NC}"
+    echo -e "${DGRAY}─────────────    ──────────    ──────────    ──────────   ${NC}"
+
+    local total_up=0 total_down=0 user_count=0
+    while IFS=: read -r user up down total; do
+        [ -z "$user" ] && continue
+        printf "%-16s %-13s %-13s %-13s\n" \
+            "$user" "$(format_bytes $up)" "$(format_bytes $down)" "$(format_bytes $total)"
+        total_up=$((total_up + up))
+        total_down=$((total_down + down))
+        user_count=$((user_count + 1))
+    done < "${tmp_combined}.sorted"
+
+    echo -e "${DGRAY}─────────────    ──────────    ──────────    ──────────   ${NC}"
+    local total_all=$((total_up + total_down))
+    printf "${YELLOW}%-16s %-13s %-13s %-13s${NC}\n" \
+        "TOTAL" "($user_count user)" \
+        "$(format_bytes $total_up)" "$(format_bytes $total_down)" "$(format_bytes $total_all)"
+
+    rm -f "$tmp_combined" "${tmp_combined}.sorted"
+    pause
+}
+
+# ============================================================================
+# NEW v2.0: cmd_setup
+# Create directories + install cron job
 # Pattern: run-once dengan confirmation (mirip clearlog.sh v7, clearcache.sh v8)
 # ============================================================================
 cmd_setup() {
     show_header
-    echo -e "${CYAN}=== SETUP BANDWIDTH PER-USER ===${NC}"
+    echo -e "${CYAN}=== SETUP BANDWIDTH PER-USER (v2.0) ===${NC}"
     echo
     echo -e "${WHITE}Setup akan melakukan:${NC}"
-    echo -e "  ${GREEN}1.${NC} Create iptables chain ${YELLOW}${CHAIN_IN}${NC} + ${YELLOW}${CHAIN_OUT}${NC}"
-    echo -e "  ${GREEN}2.${NC} Hook chain ke INPUT port ${SSH_PORT} (download counter per-IP source)"
-    echo -e "  ${GREEN}3.${NC} Hook chain ke OUTPUT port ${SSH_PORT} (upload counter per-IP dest)"
-    echo -e "  ${GREEN}4.${NC} Seed rules untuk IP SSH aktif saat ini"
-    echo -e "  ${GREEN}5.${NC} Create directory ${YELLOW}${BANDWIDTH_DIR}${NC}"
-    echo -e "  ${GREEN}6.${NC} Install cron job ${YELLOW}${CRON_FILE}${NC} (setiap 1 menit)"
+    echo -e "  ${GREEN}1.${NC} Create directories:"
+    echo -e "     ${GRAY}${SNAP_DIR}/${NC}"
+    echo -e "     ${GRAY}${HOURLY_DIR}/${NC}"
+    echo -e "     ${GRAY}${DAILY_DIR}/${NC}"
+    echo -e "  ${GREEN}2.${NC} Install cron job ${YELLOW}${CRON_FILE}${NC} (setiap 1 menit)"
+    echo -e "  ${GREEN}3.${NC} Capture initial snapshot + seed last-snap.log"
     echo
-    echo -e "${YELLOW}Limitation:${NC}"
-    echo -e "  ${GRAY}- Hanya SSH direct (port 22) yang dihitung${NC}"
-    echo -e "  ${GRAY}- Tunneling path (Cloudfront port 443, WS port 8880, Dropbear port 109/143)${NC}"
-    echo -e "    ${GRAY}TIDAK dihitung (peer IP = Cloudfront/loopback, BUKAN IP user asli)${NC}"
-    echo -e "  ${GRAY}- Untuk tunneling path, perlu OPSI B (HYBRID dengan /proc/<pid>/io)${NC}"
+    echo -e "${YELLOW}Approach:${NC}"
+    echo -e "  ${GRAY}- /proc/<pid>/io tracking untuk Dropbear child (port 109/143) + sshd (port 22)${NC}"
+    echo -e "  ${GRAY}- Cloudfront/WS-TLS/WS-NonTLS user otomatis ter-cover (via Dropbear child)${NC}"
+    echo -e "  ${GRAY}- Pattern 19 (Hybrid 4-layer resolver) untuk mapping PID → user${NC}"
+    echo
+    echo -e "${YELLOW}Periodik view yang tersedia:${NC}"
+    echo -e "  ${GRAY}- Live (active users + current bandwidth)${NC}"
+    echo -e "  ${GRAY}- Per Jam (24 jam terakhir, breakdown per jam)${NC}"
+    echo -e "  ${GRAY}- Hari Ini (total per user today)${NC}"
+    echo -e "  ${GRAY}- 7 Hari Terakhir (total per user last 7 days)${NC}"
+    echo -e "  ${GRAY}- 30 Hari Terakhir (total per user last 30 days)${NC}"
     echo
     echo -e "${RED}Prasyarat:${NC}"
-    echo -e "  ${GRAY}- Akses root (iptables butuh CAP_NET_ADMIN)${NC}"
-    echo -e "  ${GRAY}- Command iptables tersedia (default Ubuntu 20.04)${NC}"
+    echo -e "  ${GRAY}- Akses root (butuh baca /proc/<pid>/io + cron root)${NC}"
+    echo -e "  ${GRAY}- Command ss + ps + journalctl tersedia (default Ubuntu 20.04)${NC}"
     echo -e "  ${GRAY}- Cron service aktif (systemctl status cron)${NC}"
     echo
 
     # Validasi command -v (Pattern 6 v6)
-    if ! command -v iptables >/dev/null 2>&1; then
-        echo -e "${RED}ERROR: command 'iptables' tidak ditemukan.${NC}"
-        echo -e "${GRAY}Install: apt install iptables${NC}"
-        pause
-        return 1
-    fi
-    if ! command -v ss >/dev/null 2>&1; then
-        echo -e "${RED}ERROR: command 'ss' tidak ditemukan.${NC}"
-        echo -e "${GRAY}Install: apt install iproute2${NC}"
-        pause
-        return 1
-    fi
+    local missing=0
+    for cmd in ss ps journalctl getent grep awk sed cat find; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            echo -e "${RED}ERROR: command '$cmd' tidak ditemukan.${NC}"
+            missing=1
+        fi
+    done
+    [ "$missing" -ne 0 ] && { pause; return 1; }
+
     if [ "$EUID" -ne 0 ]; then
         echo -e "${RED}ERROR: Setup butuh akses root.${NC}"
         echo -e "${GRAY}Run: sudo bw-user --setup${NC}"
@@ -451,488 +905,244 @@ cmd_setup() {
         return 1
     fi
 
-    echo -e "${YELLOW}[?] Lanjut setup? (y/n): ${NC}"
-    read -rp "" confirm
-    echo
+    echo -e "${YELLOW}Lanjutkan setup? (y/n): ${NC}"
+    read -r confirm
     if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
         echo -e "${GRAY}Setup dibatalkan.${NC}"
-        pause
-        return 1
-    fi
-
-    # STEP 1: Create chain (idempotent — kalau sudah ada, skip)
-    if chain_exists "$CHAIN_IN"; then
-        echo -e "${YELLOW}[SKIP]${NC} Chain ${CYAN}${CHAIN_IN}${NC} sudah ada"
-    else
-        iptables -N "$CHAIN_IN" 2>/dev/null
-        echo -e "${GREEN}[OK]${NC} Chain ${CYAN}${CHAIN_IN}${NC} created"
-    fi
-    if chain_exists "$CHAIN_OUT"; then
-        echo -e "${YELLOW}[SKIP]${NC} Chain ${CYAN}${CHAIN_OUT}${NC} sudah ada"
-    else
-        iptables -N "$CHAIN_OUT" 2>/dev/null
-        echo -e "${GREEN}[OK]${NC} Chain ${CYAN}${CHAIN_OUT}${NC} created"
-    fi
-
-    # STEP 2: Hook chain ke INPUT port 22 (idempotent)
-    # Hook rule: jump to bw_user_in if dport 22
-    if iptables -C INPUT -p tcp --dport "$SSH_PORT" -j "$CHAIN_IN" 2>/dev/null; then
-        echo -e "${YELLOW}[SKIP]${NC} Hook INPUT port 22 sudah ada"
-    else
-        iptables -I INPUT -p tcp --dport "$SSH_PORT" -j "$CHAIN_IN" 2>/dev/null
-        echo -e "${GREEN}[OK]${NC} Hook INPUT port 22 → ${CYAN}${CHAIN_IN}${NC}"
-    fi
-    if iptables -C OUTPUT -p tcp --sport "$SSH_PORT" -j "$CHAIN_OUT" 2>/dev/null; then
-        echo -e "${YELLOW}[SKIP]${NC} Hook OUTPUT port 22 sudah ada"
-    else
-        iptables -I OUTPUT -p tcp --sport "$SSH_PORT" -j "$CHAIN_OUT" 2>/dev/null
-        echo -e "${GREEN}[OK]${NC} Hook OUTPUT port 22 → ${CYAN}${CHAIN_OUT}${NC}"
-    fi
-
-    # STEP 3: Create directory
-    mkdir -p "$BANDWIDTH_DIR" "$ACCUM_DIR"
-    echo -e "${GREEN}[OK]${NC} Directory ${CYAN}${BANDWIDTH_DIR}${NC} created"
-
-    # STEP 4: Seed rules untuk IP SSH aktif saat ini
-    local active_count=0
-    local seed_list
-    seed_list=$(get_active_ssh_connections)
-    if [ -n "$seed_list" ]; then
-        while IFS='|' read -r ip pid; do
-            [ -z "$ip" ] && continue
-            if ! rule_exists_in_chain "$CHAIN_IN" "src" "$ip"; then
-                iptables -A "$CHAIN_IN" -s "$ip" -j RETURN 2>/dev/null
-            fi
-            if ! rule_exists_in_chain "$CHAIN_OUT" "dst" "$ip"; then
-                iptables -A "$CHAIN_OUT" -d "$ip" -j RETURN 2>/dev/null
-            fi
-            active_count=$((active_count + 1))
-        done <<< "$seed_list"
-    fi
-    echo -e "${GREEN}[OK]${NC} Seed rules untuk ${YELLOW}${active_count}${NC} IP SSH aktif"
-
-    # STEP 5: Install cron
-    install_cron
-    echo -e "${GREEN}[OK]${NC} Cron ${CYAN}${CRON_FILE}${NC} installed (every 1 min)"
-
-    # STEP 6: Save iptables (persistence kalau VPS reboot)
-    if command -v iptables-save >/dev/null 2>&1; then
-        iptables-save > /etc/iptables.rules 2>/dev/null && \
-            echo -e "${GREEN}[OK]${NC} Iptables saved to ${CYAN}/etc/iptables.rules${NC}" || \
-            echo -e "${YELLOW}[WARN]${NC} iptables-save failed (non-blocking)"
-    fi
-
-    echo
-    echo -e "${GREEN}=== SETUP SELESAI ===${NC}"
-    echo -e "${GRAY}Cron akan auto-snapshot counter tiap 1 menit.${NC}"
-    echo -e "${GRAY}Run ${CYAN}bw-user${NC} (tanpa argumen) untuk interactive menu.${NC}"
-    echo -e "${GRAY}Run ${CYAN}bw-user --display${NC} untuk CLI display.${NC}"
-    pause
-}
-
-# ============================================================================
-# Command: --snap
-# Cron job: scan ss, add rules untuk IP baru, snapshot counter ke file
-# Pattern 24 v14: fetch journalctl 1x per script run (kalau resolve user)
-# Note: TIDAK resolve user di snap (cron, performance), hanya simpan counter per-IP
-# ============================================================================
-cmd_snap() {
-    # Validasi command
-    command -v iptables >/dev/null 2>&1 || return 1
-    command -v ss >/dev/null 2>&1 || return 1
-
-    # Pastikan chain ada (auto-recover kalau VPS reboot)
-    if ! chain_exists "$CHAIN_IN" || ! chain_exists "$CHAIN_OUT"; then
-        # Auto-recover: re-create chain + hook (idempotent setup)
-        chain_exists "$CHAIN_IN" || iptables -N "$CHAIN_IN" 2>/dev/null
-        chain_exists "$CHAIN_OUT" || iptables -N "$CHAIN_OUT" 2>/dev/null
-        iptables -C INPUT -p tcp --dport "$SSH_PORT" -j "$CHAIN_IN" 2>/dev/null || \
-            iptables -I INPUT -p tcp --dport "$SSH_PORT" -j "$CHAIN_IN" 2>/dev/null
-        iptables -C OUTPUT -p tcp --sport "$SSH_PORT" -j "$CHAIN_OUT" 2>/dev/null || \
-            iptables -I OUTPUT -p tcp --sport "$SSH_PORT" -j "$CHAIN_OUT" 2>/dev/null
-    fi
-
-    mkdir -p "$BANDWIDTH_DIR" "$ACCUM_DIR"
-
-    # Get active SSH connections
-    local active_list
-    active_list=$(get_active_ssh_connections)
-    local active_ips=""
-    if [ -n "$active_list" ]; then
-        while IFS='|' read -r ip pid; do
-            [ -z "$ip" ] && continue
-            active_ips="${active_ips}${ip}|"
-            # Add rule untuk IP baru (idempotent)
-            if ! rule_exists_in_chain "$CHAIN_IN" "src" "$ip"; then
-                iptables -A "$CHAIN_IN" -s "$ip" -j RETURN 2>/dev/null
-            fi
-            if ! rule_exists_in_chain "$CHAIN_OUT" "dst" "$ip"; then
-                iptables -A "$CHAIN_OUT" -d "$ip" -j RETURN 2>/dev/null
-            fi
-        done <<< "$active_list"
-    fi
-
-    # Snapshot counter dari iptables untuk SEMUA rule yang ada di chain
-    # Format snap file: timestamp|ip|in_bytes|out_bytes
-    local snap_ts
-    snap_ts=$(date +%s)
-    : > "$SNAP_FILE.tmp"
-
-    # Read INPUT chain counters
-    # Output iptables -L -v -n -x: pkts bytes target prot opt in out source destination
-    # Rule RETURN dengan source IP = per-IP counter
-    iptables -L "$CHAIN_IN" -v -n -x 2>/dev/null | awk '
-        /^ *[0-9]+ +[0-9]+ +RETURN/ {
-            # Field 8 = source IP (kalau bukan 0.0.0.0/0)
-            if ($8 != "0.0.0.0/0" && $8 != "") {
-                print $8 "|" $2
-            }
-        }
-    ' | while IFS='|' read -r ip in_bytes; do
-        # Find matching out_bytes from OUTPUT chain
-        # FIX1-A v16: OUTPUT chain pakai $9 (destination IP), BUKAN $8 (source = 0.0.0.0/0)
-        # Format OUTPUT: pkts bytes target prot opt in out source destination
-        # Rule ditambahkan dengan -d <ip> jadi destination = IP user
-        local out_bytes=0
-        out_bytes=$(iptables -L "$CHAIN_OUT" -v -n -x 2>/dev/null | awk -v ip="$ip" '
-            /^ *[0-9]+ +[0-9]+ +RETURN/ {
-                if ($9 == ip) print $2
-            }
-        ' | head -1)
-        out_bytes=${out_bytes:-0}
-        echo "${snap_ts}|${ip}|${in_bytes}|${out_bytes}" >> "$SNAP_FILE.tmp"
-    done
-
-    # Atomic move
-    mv "$SNAP_FILE.tmp" "$SNAP_FILE"
-
-    # Save iptables (persistence)
-    command -v iptables-save >/dev/null 2>&1 && iptables-save > /etc/iptables.rules 2>/dev/null
-}
-
-# ============================================================================
-# Command: --display
-# Tampilkan tabel bandwidth per-user (map IP → user via Pattern 19)
-# Source: live counter dari iptables + accumulation file (untuk IP yang disconnect)
-# ============================================================================
-cmd_display() {
-    show_header
-    echo -e "${CYAN}=== BANDWIDTH PER-USER (SSH DIRECT PORT 22) ===${NC}"
-    echo
-
-    # Validasi chain ada
-    if ! chain_exists "$CHAIN_IN" 2>/dev/null; then
-        echo -e "${YELLOW}[!] Chain ${CHAIN_IN} belum ada.${NC}"
-        echo -e "${GRAY}    Run ${CYAN}bw-user --setup${NC}${GRAY} dulu untuk inisialisasi.${NC}"
-        echo
-        pause
-        return 1
-    fi
-
-    # Pastikan snap file up-to-date (jalankan snap inline kalau >60 detik lalu)
-    if [ -f "$SNAP_FILE" ]; then
-        local snap_age=9999
-        local now_ts file_ts
-        now_ts=$(date +%s)
-        file_ts=$(stat -c %Y "$SNAP_FILE" 2>/dev/null || echo 0)
-        snap_age=$((now_ts - file_ts))
-        if [ "$snap_age" -gt 60 ]; then
-            # Snap file stale (>60s), run snap inline
-            cmd_snap 2>/dev/null
-        fi
-    else
-        # Snap file belum ada, run snap inline
-        cmd_snap 2>/dev/null
-    fi
-
-    # Read snap file (live counter per-IP)
-    local user_data=""
-    declare -A ip_to_user  # Associative array: ip → username
-    declare -A ip_in_bytes
-    declare -A ip_out_bytes
-
-    if [ -f "$SNAP_FILE" ]; then
-        while IFS='|' read -r ts ip in_bytes out_bytes; do
-            [ -z "$ip" ] && continue
-            # Resolve PID dari ss untuk SSH direct port 22 dengan peer IP target
-            # Filter ss hanya untuk port 22 (sport = :22) supaya tidak match IP di port lain
-            local pid_resolved
-            pid_resolved=$(ss -tnpH state established "( sport = :$SSH_PORT )" 2>/dev/null | \
-                grep -F " $ip:" | grep -oP 'pid=\K[0-9]+' | head -1)
-            [ -z "$pid_resolved" ] && pid_resolved="?"
-
-            # Resolve user: Pattern 19 (by PID) jika aktif, fallback Pattern 28 (by IP dari auth.log)
-            # FIX2-B v16: Kalau PID tidak ada di current ss (disconnected/historical),
-            # resolve username via auth.log by IP
-            local username
-            if [ "$pid_resolved" = "?" ]; then
-                username=$(resolve_user_from_ip "$ip")
-            else
-                username=$(resolve_user_from_pid "$pid_resolved")
-            fi
-            [ -z "$username" ] && username="-"
-
-            # Skip system daemon users (sslh, daemon, dll) — root TIDAK difilter (admin valid, FIX1-B v16)
-            local is_system=0
-            for sys_user in $SYSTEM_USERS_FILTER; do
-                if [ "$username" = "$sys_user" ]; then
-                    is_system=1
-                    break
-                fi
-            done
-            [ "$is_system" -eq 1 ] && continue
-
-            # Accumulate per-IP (kalau ada multiple PID untuk IP yang sama, sum)
-            ip_to_user["$ip"]="$username"
-            ip_in_bytes["$ip"]=$(( ${ip_in_bytes["$ip"]:-0} + ${in_bytes:-0} ))
-            ip_out_bytes["$ip"]=$(( ${ip_out_bytes["$ip"]:-0} + ${out_bytes:-0} ))
-        done < "$SNAP_FILE"
-    fi
-
-    # Display table
-    if [ ${#ip_to_user[@]} -eq 0 ]; then
-        echo -e "${YELLOW}Belum ada data bandwidth.${NC}"
-        echo -e "${GRAY}Pastikan:${NC}"
-        echo -e "  ${GRAY}- Setup sudah dijalankan (bw-user --setup)${NC}"
-        echo -e "  ${GRAY}- Ada user SSH direct (port 22) yang aktif${NC}"
-        echo -e "  ${GRAY}- Cron berjalan (cek /etc/cron.d/bw-user)${NC}"
-        echo
         pause
         return 0
     fi
 
-    # Header table
-    echo -e "${WHITE}USERNAME        IP                    DOWN         UP           TOTAL${NC}"
-    echo -e "${DGRAY}─────────────   ───────────────────   ──────────   ──────────   ──────────${NC}"
+    echo
+    echo -e "${CYAN}[1/4] Create directories...${NC}"
+    mkdir -p "$SNAP_DIR" "$HOURLY_DIR" "$DAILY_DIR"
+    echo -e "  ${GREEN}OK${NC} ${SNAP_DIR}"
+    echo -e "  ${GREEN}OK${NC} ${HOURLY_DIR}"
+    echo -e "  ${GREEN}OK${NC} ${DAILY_DIR}"
 
-    # Sort by total bytes DESC, display
-    local total_in=0
-    local total_out=0
-    local user_count=0
+    echo -e "${CYAN}[2/4] Install cron job...${NC}"
+    cat > "$CRON_FILE" <<EOF
+# Autogenerated by bw-user v${SCRIPT_VERSION} (HAXOR Panel Tunneling)
+# Cron job: snapshot /proc/<pid>/io + accumulate per-user
+# Schedule: every 1 minute
+* * * * * root /usr/bin/bw-user --snap >/dev/null 2>&1
+EOF
+    chmod 644 "$CRON_FILE"
+    echo -e "  ${GREEN}OK${NC} ${CRON_FILE} (every 1 minute)"
 
-    # Build sortable output (raw bytes|username|ip|in|out)
-    local sort_data=""
-    for ip in "${!ip_to_user[@]}"; do
-        local in_b=${ip_in_bytes["$ip"]:-0}
-        local out_b=${ip_out_bytes["$ip"]:-0}
-        local total_b=$((in_b + out_b))
-        sort_data="${sort_data}${total_b}|${ip_to_user[$ip]}|${ip}|${in_b}|${out_b}
-"
-        total_in=$((total_in + in_b))
-        total_out=$((total_out + out_b))
-        user_count=$((user_count + 1))
-    done
+    echo -e "${CYAN}[3/4] Capture initial snapshot...${NC}"
+    # Run snap once to seed last-snap.log
+    /usr/bin/bw-user --snap >/dev/null 2>&1
+    if [ -f "$LAST_SNAP" ]; then
+        echo -e "  ${GREEN}OK${NC} last-snap.log seeded"
+    else
+        echo -e "  ${YELLOW}WARN${NC} last-snap.log belum ada (mungkin belum ada koneksi aktif)"
+    fi
 
-    # Sort DESC by total bytes (column 1)
-    printf '%s' "$sort_data" | sort -t'|' -k1,1nr | while IFS='|' read -r total_b username ip in_b out_b; do
-        [ -z "$total_b" ] && continue
-        local down_str up_str total_str
-        down_str=$(format_bytes "$in_b")
-        up_str=$(format_bytes "$out_b")
-        total_str=$(format_bytes "$total_b")
-        # Pad columns (Pattern 17 v12: plain text, no ANSI in printf %s untuk alignment)
-        printf "%-14s  %-20s  %-11s  %-11s  %-11s\n" \
-            "$username" "$ip" "$down_str" "$up_str" "$total_str"
-    done
-
-    # Footer
-    echo -e "${DGRAY}─────────────   ───────────────────   ──────────   ──────────   ──────────${NC}"
-    local total_in_str total_out_str total_all_str
-    total_in_str=$(format_bytes "$total_in")
-    total_out_str=$(format_bytes "$total_out")
-    total_all_str=$(format_bytes "$((total_in + total_out))")
-    printf "${YELLOW}%-14s  %-20s  %-11s  %-11s  %-11s${NC}\n" \
-        "TOTAL" "(${user_count} user)" "$total_in_str" "$total_out_str" "$total_all_str"
+    echo -e "${CYAN}[4/4] Verify setup...${NC}"
+    echo -e "  ${GRAY}Directory:${NC} $(ls -d "$SNAP_DIR" "$HOURLY_DIR" "$DAILY_DIR" 2>/dev/null | wc -l)/3 created"
+    echo -e "  ${GRAY}Cron file:${NC} $([ -f "$CRON_FILE" ] && echo 'EXISTS' || echo 'MISSING')"
+    echo -e "  ${GRAY}Last snap:${NC} $([ -f "$LAST_SNAP" ] && echo 'EXISTS' || echo 'NOT YET')"
 
     echo
-    echo -e "${GRAY}Limitation: Hanya SSH direct (port 22).${NC}"
-    echo -e "${GRAY}Tunneling path (Cloudfront/WS/Dropbear) TIDAK dihitung.${NC}"
-    echo -e "${GRAY}Counter di-reset saat VPS reboot. Cron tiap 1 menit auto-snapshot.${NC}"
-    echo
+    echo -e "${GREEN}=== SETUP SELESAI ===${NC}"
+    echo -e "${GRAY}Cron akan auto-snapshot tiap 1 menit. Tunggu 2-3 menit lalu jalankan:${NC}"
+    echo -e "  ${YELLOW}bw-user${NC}               ${GRAY}(interactive menu)${NC}"
+    echo -e "  ${YELLOW}bw-user --display${NC}     ${GRAY}(live display)${NC}"
+    echo -e "  ${YELLOW}bw-user --hourly${NC}      ${GRAY}(24 jam terakhir)${NC}"
     pause
 }
 
 # ============================================================================
-# Command: --reset
-# Clear all iptables rules di chain + accumulation file
+# NEW v2.0: cmd_reset
+# Clear all snapshot + accum data, keep cron + dirs
+# Pattern: run-once dengan confirmation prompt "YA" huruf besar
 # ============================================================================
 cmd_reset() {
     show_header
-    echo -e "${RED}=== RESET BANDWIDTH COUNTER ===${NC}"
+    echo -e "${CYAN}=== RESET BANDWIDTH DATA ===${NC}"
     echo
-    echo -e "${YELLOW}Reset akan:${NC}"
-    echo -e "  ${RED}1.${NC} Hapus SEMUA rule di chain ${CYAN}${CHAIN_IN}${NC} + ${CYAN}${CHAIN_OUT}${NC}"
-    echo -e "  ${RED}2.${NC} Hapus snap file ${CYAN}${SNAP_FILE}${NC}"
-    echo -e "  ${RED}3.${NC} Hapus accumulation dir ${CYAN}${ACCUM_DIR}${NC}"
-    echo -e "  ${RED}4.${NC} Hapus cron file ${CYAN}${CRON_FILE}${NC}"
-    echo -e "  ${RED}5.${NC} Hook INPUT/OUTPUT port 22 di-unhook (chain tetap ada, kosong)"
+    echo -e "${RED}PERINGATAN:${NC} Ini akan menghapus SEMUA data bandwidth:"
+    echo -e "  ${GRAY}- Snapshots: ${SNAP_DIR}/*.log${NC}"
+    echo -e "  ${GRAY}- Hourly accum: ${HOURLY_DIR}/*.log${NC}"
+    echo -e "  ${GRAY}- Daily accum: ${DAILY_DIR}/*.log${NC}"
+    echo -e "  ${GRAY}- Last snap: ${LAST_SNAP}${NC}"
     echo
-    echo -e "${RED}PERINGATAN: Semua counter bandwidth per-IP akan hilang!${NC}"
-    echo -e "${GRAY}Reset tidak menghapus user SSH, hanya statistik bandwidth.${NC}"
+    echo -e "${YELLOW}Cron job + directories TIDAK dihapus (tetap aktif).${NC}"
+    echo -e "${YELLOW}Reset tidak bisa di-undo. Lanjutkan?${NC}"
     echo
-
-    if [ "$EUID" -ne 0 ]; then
-        echo -e "${RED}ERROR: Reset butuh akses root.${NC}"
-        echo -e "${GRAY}Run: sudo bw-user --reset${NC}"
-        pause
-        return 1
-    fi
-
-    echo -e "${YELLOW}[?] Yakin ingin reset? Ketik 'YA' (huruf besar): ${NC}"
-    read -rp "" confirm
-    echo
+    echo -e "${RED}Ketik 'YA' (huruf besar) untuk konfirmasi: ${NC}"
+    read -r confirm
     if [ "$confirm" != "YA" ]; then
         echo -e "${GRAY}Reset dibatalkan.${NC}"
         pause
-        return 1
+        return 0
     fi
 
-    # STEP 1: Flush rules di chain
-    if chain_exists "$CHAIN_IN"; then
-        iptables -F "$CHAIN_IN" 2>/dev/null
-        echo -e "${GREEN}[OK]${NC} Chain ${CYAN}${CHAIN_IN}${NC} flushed"
-    fi
-    if chain_exists "$CHAIN_OUT"; then
-        iptables -F "$CHAIN_OUT" 2>/dev/null
-        echo -e "${GREEN}[OK]${NC} Chain ${CYAN}${CHAIN_OUT}${NC} flushed"
-    fi
+    echo
+    echo -e "${CYAN}[1/4] Hapus snapshots...${NC}"
+    rm -f "${SNAP_DIR}"/*.log 2>/dev/null
+    echo -e "  ${GREEN}OK${NC}"
 
-    # STEP 2: Unhook chain dari INPUT/OUTPUT
-    while iptables -C INPUT -p tcp --dport "$SSH_PORT" -j "$CHAIN_IN" 2>/dev/null; do
-        iptables -D INPUT -p tcp --dport "$SSH_PORT" -j "$CHAIN_IN" 2>/dev/null
-    done
-    while iptables -C OUTPUT -p tcp --sport "$SSH_PORT" -j "$CHAIN_OUT" 2>/dev/null; do
-        iptables -D OUTPUT -p tcp --sport "$SSH_PORT" -j "$CHAIN_OUT" 2>/dev/null
-    done
-    echo -e "${GREEN}[OK]${NC} Hook INPUT/OUTPUT port 22 di-unhook"
+    echo -e "${CYAN}[2/4] Hapus hourly accum...${NC}"
+    rm -f "${HOURLY_DIR}"/*.log 2>/dev/null
+    echo -e "  ${GREEN}OK${NC}"
 
-    # STEP 3: Hapus chain (kalau kosong)
-    iptables -X "$CHAIN_IN" 2>/dev/null && echo -e "${GREEN}[OK]${NC} Chain ${CYAN}${CHAIN_IN}${NC} deleted"
-    iptables -X "$CHAIN_OUT" 2>/dev/null && echo -e "${GREEN}[OK]${NC} Chain ${CYAN}${CHAIN_OUT}${NC} deleted"
+    echo -e "${CYAN}[3/4] Hapus daily accum...${NC}"
+    rm -f "${DAILY_DIR}"/*.log 2>/dev/null
+    echo -e "  ${GREEN}OK${NC}"
 
-    # STEP 4: Hapus snap file + accum dir
-    rm -f "$SNAP_FILE" 2>/dev/null && echo -e "${GREEN}[OK]${NC} Snap file dihapus"
-    rm -rf "$ACCUM_DIR" 2>/dev/null && echo -e "${GREEN}[OK]${NC} Accumulation dir dihapus"
-
-    # STEP 5: Hapus cron file
-    rm -f "$CRON_FILE" 2>/dev/null && echo -e "${GREEN}[OK]${NC} Cron file dihapus"
-
-    # STEP 6: Save iptables (persistence)
-    command -v iptables-save >/dev/null 2>&1 && iptables-save > /etc/iptables.rules 2>/dev/null
+    echo -e "${CYAN}[4/4] Hapus last-snap.log...${NC}"
+    rm -f "$LAST_SNAP" 2>/dev/null
+    echo -e "  ${GREEN}OK${NC}"
 
     echo
     echo -e "${GREEN}=== RESET SELESAI ===${NC}"
-    echo -e "${GRAY}Run ${CYAN}bw-user --setup${NC}${GRAY} untuk setup ulang.${NC}"
+    echo -e "${GRAY}Data bandwidth kosong. Cron akan mulai capture baru tiap 1 menit.${NC}"
     pause
 }
 
 # ============================================================================
-# Command: --help
+# NEW v2.0: cmd_help
 # ============================================================================
 cmd_help() {
     show_header
-    echo -e "${CYAN}=== HELP - BANDWIDTH PER-USER ===${NC}"
+    echo -e "${CYAN}=== HELP - bw-user v${SCRIPT_VERSION} ===${NC}"
     echo
-    echo -e "${WHITE}DESKRIPSI:${NC}"
-    echo -e "  ${GRAY}Bandwidth per-user untuk SSH direct (port 22) via iptables accounting.${NC}"
-    echo -e "  ${GRAY}Counter di-snapshot tiap 1 menit via cron, IP → user via Pattern 19.${NC}"
+    echo -e "${WHITE}PURPOSE:${NC}"
+    echo -e "  ${GRAY}Bandwidth per-user via /proc/<pid>/io tracking untuk SEMUA path tunneling:${NC}"
+    echo -e "  ${GRAY}SSH direct (port 22) + Dropbear child (port 109/143).${NC}"
+    echo -e "  ${GRAY}Cloudfront/WS-TLS/WS-NonTLS user otomatis ter-cover karena trafficnya${NC}"
+    echo -e "  ${GRAY}di-handle oleh Dropbear child.${NC}"
     echo
-    echo -e "${WHITE}MENU OPSI (interactive):${NC}"
-    echo -e "  ${YELLOW}01${NC}  Display bandwidth per-user"
-    echo -e "  ${YELLOW}02${NC}  Setup (chain + cron + seed)"
-    echo -e "  ${YELLOW}03${NC}  Snapshot manual (run cron logic now)"
-    echo -e "  ${YELLOW}04${NC}  Reset counter + accumulation"
-    echo -e "  ${YELLOW}05${NC}  Help"
-    echo -e "  ${YELLOW}0X${NC}  Exit ke menu utama HAXOR"
+    echo -e "${WHITE}USAGE:${NC}"
+    echo -e "  ${YELLOW}bw-user${NC}              ${GRAY}Interactive menu (recommended)${NC}"
+    echo -e "  ${YELLOW}bw-user --display${NC}    ${GRAY}Live display (active users + current bw)${NC}"
+    echo -e "  ${YELLOW}bw-user --hourly${NC}     ${GRAY}24 jam terakhir (breakdown per jam)${NC}"
+    echo -e "  ${YELLOW}bw-user --today${NC}      ${GRAY}Total per user hari ini${NC}"
+    echo -e "  ${YELLOW}bw-user --7d${NC}         ${GRAY}7 hari terakhir (total per user)${NC}"
+    echo -e "  ${YELLOW}bw-user --30d${NC}        ${GRAY}30 hari terakhir (total per user)${NC}"
+    echo -e "  ${YELLOW}bw-user --setup${NC}      ${GRAY}Setup dirs + cron (1x setelah install)${NC}"
+    echo -e "  ${YELLOW}bw-user --snap${NC}       ${GRAY}Cron job (auto, jangan manual)${NC}"
+    echo -e "  ${YELLOW}bw-user --reset${NC}      ${GRAY}Clear all data (keep cron)${NC}"
+    echo -e "  ${YELLOW}bw-user --version${NC}    ${GRAY}Tampilkan versi${NC}"
     echo
-    echo -e "${WHITE}CLI FLAGS:${NC}"
-    echo -e "  ${CYAN}--display${NC}     Tampilkan tabel bandwidth"
-    echo -e "  ${CYAN}--setup${NC}       Setup chain + cron"
-    echo -e "  ${CYAN}--snap${NC}        Cron job - snapshot counter"
-    echo -e "  ${CYAN}--reset${NC}       Reset counter + accumulation"
-    echo -e "  ${CYAN}--help${NC}        Tampilkan help ini"
-    echo -e "  ${CYAN}--version${NC}     Tampilkan versi"
+    echo -e "${WHITE}MENU INTERACTIVE:${NC}"
+    echo -e "  ${GREEN}01${NC} Live Display       ${GRAY}- Active users + current bandwidth${NC}"
+    echo -e "  ${GREEN}02${NC} Per Jam (24 jam)    ${GRAY}- Breakdown per jam (24 rows)${NC}"
+    echo -e "  ${GREEN}03${NC} Hari Ini            ${GRAY}- Total per user hari ini${NC}"
+    echo -e "  ${GREEN}04${NC} 7 Hari Terakhir     ${GRAY}- Total per user 7 hari${NC}"
+    echo -e "  ${GREEN}05${NC} 30 Hari Terakhir    ${GRAY}- Total per user 30 hari${NC}"
+    echo -e "  ${GREEN}06${NC} Setup               ${GRAY}- Install dirs + cron${NC}"
+    echo -e "  ${GREEN}07${NC} Reset               ${GRAY}- Clear all data${NC}"
+    echo -e "  ${GREEN}08${NC} Help                ${GRAY}- Tampilkan help ini${NC}"
+    echo -e "  ${GREEN}0X${NC} Exit                ${GRAY}- Kembali ke menu utama${NC}"
     echo
-    echo -e "${WHITE}LIMITATION:${NC}"
-    echo -e "  ${YELLOW}Hanya SSH direct (port 22) yang dihitung.${NC}"
-    echo -e "  ${GRAY}Tunneling path TIDAK dihitung (peer IP = Cloudfront/loopback):${NC}"
-    echo -e "    ${GRAY}- Cloudfront port 443 (peer = 52.46.55.x AWS edge)${NC}"
-    echo -e "    ${GRAY}- WebSocket NonTLS port 8880 (peer = 127.0.0.1)${NC}"
-    echo -e "    ${GRAY}- Dropbear port 109/143 (peer = 127.0.0.1)${NC}"
-    echo -e "  ${GRAY}Untuk tunneling path, perlu OPSI B (HYBRID dengan /proc/<pid>/io).${NC}"
-    echo
-    echo -e "${WHITE}FLOW:${NC}"
-    echo -e "  ${GREEN}1.${NC} Run ${CYAN}bw-user --setup${NC} (1x, butuh root)"
-    echo -e "  ${GREEN}2.${NC} Cron auto-snapshot tiap 1 menit"
-    echo -e "  ${GREEN}3.${NC} Run ${CYAN}bw-user${NC} (interactive) atau ${CYAN}bw-user --display${NC}"
+    echo -e "${WHITE}ARCHITECTURE:${NC}"
+    echo -e "  ${GRAY}1. Cron tiap 1 menit capture snapshot semua active PID${NC}"
+    echo -e "     ${GRAY}- Scan ss untuk Dropbear (port 109/143) + sshd (port 22)${NC}"
+    echo -e "     ${GRAY}- Read /proc/<pid>/io (rchar, wchar)${NC}"
+    echo -e "     ${GRAY}- Resolve user via Pattern 19 (auth.log PID matching)${NC}"
+    echo -e "  ${GRAY}2. Calculate delta vs last snapshot${NC}"
+    echo -e "     ${GRAY}- Handle PID reuse (different user → treat as new)${NC}"
+    echo -e "     ${GRAY}- Handle new PID (delta = current value)${NC}"
+    echo -e "  ${GRAY}3. Accumulate per-user ke hourly file${NC}"
+    echo -e "     ${GRAY}- ${HOURLY_DIR}/YYYY-MM-DD-HH.log${NC}"
+    echo -e "  ${GRAY}4. Cleanup old files (snapshots 7d, hourly 30d, daily 90d)${NC}"
     echo
     echo -e "${WHITE}FILES:${NC}"
-    echo -e "  ${CYAN}/usr/bin/bw-user${NC}              Script ini"
-    echo -e "  ${CYAN}${CRON_FILE}${NC}      Cron schedule (every 1 min)"
-    echo -e "  ${CYAN}${SNAP_FILE}${NC}      Last snapshot (timestamp|ip|in|out)"
-    echo -e "  ${CYAN}${BANDWIDTH_DIR}/${NC}              Directory root"
+    echo -e "  ${GRAY}/usr/bin/bw-user${NC}              ${GRAY}(this script)${NC}"
+    echo -e "  ${GRAY}${CRON_FILE}${NC}      ${GRAY}(cron schedule)${NC}"
+    echo -e "  ${GRAY}${SNAP_DIR}/${NC}         ${GRAY}(per-minute snapshots)${NC}"
+    echo -e "  ${GRAY}${HOURLY_DIR}/${NC}    ${GRAY}(accumulated per hour)${NC}"
+    echo -e "  ${GRAY}${DAILY_DIR}/${NC}     ${GRAY}(daily rollup, future)${NC}"
+    echo -e "  ${GRAY}${LAST_SNAP}${NC}         ${GRAY}(last snapshot for delta calc)${NC}"
     echo
-    echo -e "${WHITE}PATTERN:${NC}"
-    echo -e "  ${GRAY}Pattern 1 (re-entrant show_menu) untuk opsi 01-05${NC}"
-    echo -e "  ${GRAY}Pattern 3 (re-entrant while-loop) untuk root menu${NC}"
-    echo -e "  ${GRAY}Pattern 4 (pause prompt) untuk external submenu${NC}"
-    echo -e "  ${GRAY}Pattern 5 (palette 256-color ANSI-C quoting)${NC}"
-    echo -e "  ${GRAY}Pattern 6 (validasi command -v) untuk iptables, ss, journalctl${NC}"
-    echo -e "  ${GRAY}Pattern 7 (exit 0X → menu)${NC}"
-    echo -e "  ${GRAY}Pattern 8 (NO license check, NO bot integration)${NC}"
-    echo -e "  ${GRAY}Pattern 9 (branding HAXOR + BELITONG)${NC}"
-    echo -e "  ${GRAY}Pattern 15 (Safe append ke worklog.md)${NC}"
-    echo -e "  ${GRAY}Pattern 17 (Plain text untuk kolom tabel alignment)${NC}"
-    echo -e "  ${GRAY}Pattern 19 (auth.log PID matching untuk resolve user)${NC}"
-    echo -e "  ${GRAY}Pattern 20 (Hybrid 4-layer resolver)${NC}"
-    echo -e "  ${GRAY}Pattern 24 (Global journal cache untuk performance)${NC}"
-    echo -e "  ${GRAY}Pattern 28 (resolve user by IP - fallback untuk IP disconnected)${NC}"
+    echo -e "${WHITE}PATTERNS USED:${NC}"
+    echo -e "  ${GRAY}- Pattern 4 (v9): Pause prompt untuk external submenu${NC}"
+    echo -e "  ${GRAY}- Pattern 5 (v6): Palette 256-color ANSI-C quoting${NC}"
+    echo -e "  ${GRAY}- Pattern 6 (v6): Validasi command -v${NC}"
+    echo -e "  ${GRAY}- Pattern 7 (v9): Exit 0X → menu utama${NC}"
+    echo -e "  ${GRAY}- Pattern 8 (v9): NO license IP check, NO bot integration${NC}"
+    echo -e "  ${GRAY}- Pattern 16 (v12): Pure bash + regex untuk parsing${NC}"
+    echo -e "  ${GRAY}- Pattern 17 (v12): Plain text untuk kolom width alignment${NC}"
+    echo -e "  ${GRAY}- Pattern 19 (v13): Hybrid 4-layer resolver (PID → user)${NC}"
+    echo -e "  ${GRAY}- Pattern 24 (v14): Global journal cache untuk performance${NC}"
+    echo -e "  ${GRAY}- Pattern 28 (v16): resolve_user_from_ip (legacy fallback)${NC}"
     echo
+    echo -e "${WHITE}LIMITATIONS:${NC}"
+    echo -e "  ${GRAY}- rchar/wchar adalah cumulative counter (reset saat PID exit)${NC}"
+    echo -e "  ${GRAY}- Max 1 menit traffic lost saat user disconnect (acceptable)${NC}"
+    echo -e "  ${GRAY}- User '?' (scanner/failed auth) di-skip dari display${NC}"
+    echo -e "  ${GRAY}- Counter di-reset saat VPS reboot (accum files tetap utuh)${NC}"
     pause
 }
 
 # ============================================================================
-# Show menu (re-entrant while-loop - Pattern 3 v9)
+# NEW v2.0: show_menu (re-entrant via while-loop, Pattern 3 v9)
 # ============================================================================
 show_menu() {
     while true; do
-        show_header
-        echo -e "${CYAN}=== MENU BANDWIDTH PER-USER ===${NC}"
+        clear
+        echo -e "${BG_CYAN}                                                  ${NC}"
+        echo -e "${BG_CYAN}  BANDWIDTH PER-USER - HAXOR TUNNELING             ${NC}"
+        echo -e "${BG_TEAL}  DEKENG ANE BIAK BELITONG                         ${NC}"
+        echo -e "${BG_CYAN}                                                  ${NC}"
+        echo -e "${GRAY}  /proc/<pid>/io - Dropbear child + sshd PID tracking${NC}"
         echo
-        echo -e "  ${YELLOW}01${NC}  Display bandwidth per-user"
-        echo -e "  ${YELLOW}02${NC}  Setup (chain + cron + seed) ${GRAY}[1x run]${NC}"
-        echo -e "  ${YELLOW}03${NC}  Snapshot manual (run cron logic now)"
-        echo -e "  ${YELLOW}04${NC}  Reset counter + accumulation ${GRAY}[destructive]${NC}"
-        echo -e "  ${YELLOW}05${NC}  Help"
+        echo -e "${YELLOW}=== MENU BANDWIDTH PER-USER ===${NC}"
         echo
-        echo -e "  ${YELLOW}0X${NC}  Exit ke menu utama HAXOR"
+        echo -e "  ${GREEN}01${NC}  Live Display        ${GRAY}(active users + current bw)${NC}"
+        echo -e "  ${GREEN}02${NC}  Per Jam (24 jam)    ${GRAY}(breakdown per jam)${NC}"
+        echo -e "  ${GREEN}03${NC}  Hari Ini            ${GRAY}(total per user today)${NC}"
+        echo -e "  ${GREEN}04${NC}  7 Hari Terakhir      ${GRAY}(total per user last 7 days)${NC}"
+        echo -e "  ${GREEN}05${NC}  30 Hari Terakhir     ${GRAY}(total per user last 30 days)${NC}"
+        echo -e "  ${GREEN}06${NC}  Setup               ${GRAY}(install dirs + cron)${NC}"
+        echo -e "  ${GREEN}07${NC}  Reset               ${GRAY}(clear all data)${NC}"
+        echo -e "  ${GREEN}08${NC}  Help                ${GRAY}(tampilkan help)${NC}"
+        echo -e "  ${GREEN}0X${NC}  Exit                ${GRAY}(kembali ke menu utama)${NC}"
         echo
-        read -rp "${GRAY}Pilih opsi [01-05 / 0X]: ${NC}" choice
-        case "$choice" in
-            01|1) cmd_display ;;
-            02|2) cmd_setup ;;
-            03|3) cmd_snap; echo; echo -e "${GREEN}[OK]${NC} Snapshot selesai"; pause ;;
-            04|4) cmd_reset ;;
-            05|5) cmd_help ;;
+        read -rp "${GRAY}Pilih opsi [01-08 / 0X]: ${NC}" opt
+
+        case "$opt" in
+            01|1) cmd_display_live ;;
+            02|2) cmd_display_hourly ;;
+            03|3) cmd_display_today ;;
+            04|4) cmd_display_range 7 "BANDWIDTH 7 HARI TERAKHIR (PER USER)" ;;
+            05|5) cmd_display_range 30 "BANDWIDTH 30 HARI TERAKHIR (PER USER)" ;;
+            06|6) cmd_setup ;;
+            07|7) cmd_reset ;;
+            08|8) cmd_help ;;
             0|00|x|X|0x|0X) clear; return 0 ;;
-            *) echo -e "${RED}Opsi tidak dikenal. Pilih [01-05 atau 0X]${NC}"; sleep 2 ;;
+            *)
+                echo -e "${RED}Opsi tidak dikenal. Pilih: 01-08 atau 0X (exit)${NC}"
+                sleep 2
+                ;;
         esac
     done
 }
 
 # ============================================================================
-# Main: dispatch CLI args atau interactive menu
+# Main dispatch
 # ============================================================================
 main() {
-    case "${1:-}" in
-        --display)    cmd_display; exit 0 ;;
-        --setup)      cmd_setup; exit 0 ;;
-        --snap)       cmd_snap; exit 0 ;;
-        --reset)      cmd_reset; exit 0 ;;
-        --help|-h)    cmd_help; exit 0 ;;
-        --version|-v) echo "bw-user v${SCRIPT_VERSION} (HAXOR Panel Tunneling)"; exit 0 ;;
-        "")           show_menu; exit 0 ;;
-        *)            echo "Unknown: $1"; echo "Run: bw-user --help"; exit 1 ;;
+    case "$1" in
+        --display)    cmd_display_live ;;
+        --hourly)     cmd_display_hourly ;;
+        --today)      cmd_display_today ;;
+        --7d)         cmd_display_range 7 "BANDWIDTH 7 HARI TERAKHIR (PER USER)" ;;
+        --30d)        cmd_display_range 30 "BANDWIDTH 30 HARI TERAKHIR (PER USER)" ;;
+        --setup)      cmd_setup ;;
+        --snap)       cmd_snap ;;
+        --reset)      cmd_reset ;;
+        --help|-h)    cmd_help ;;
+        --version|-v) echo "bw-user v${SCRIPT_VERSION} (HAXOR Panel Tunneling)" ;;
+        "")           show_menu ;;
+        *)
+            echo "Usage: bw-user [--display|--hourly|--today|--7d|--30d|--setup|--snap|--reset|--help|--version]"
+            echo "       Run 'bw-user' for interactive menu."
+            exit 1
+            ;;
     esac
 }
 
