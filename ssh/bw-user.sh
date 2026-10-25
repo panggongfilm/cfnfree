@@ -39,8 +39,9 @@ WHITE=$'\033[38;5;255m'
 GRAY=$'\033[38;5;245m'
 DGRAY=$'\033[38;5;238m'
 NC=$'\033[0m'
-BG_CYAN=$'\033[48;5;51m'
-BG_TEAL=$'\033[48;5;80m'
+# FIX2-A v16: Darker BG colors (was 51/80 = neon, too glaring). New: dark cyan + medium cyan
+BG_CYAN=$'\033[48;5;24m'
+BG_TEAL=$'\033[48;5;30m'
 
 # --- Constants ---
 SCRIPT_VERSION="1.0"
@@ -271,6 +272,60 @@ resolve_user_from_pid() {
     fi
 
     echo "-"
+}
+
+# ============================================================================
+# Pattern 28 (NEW v16-Sesi-2.5-A-FIX2): Resolve username by IP from auth.log
+# Used when PID NOT found in current `ss` (IP disconnected/historical/scanner)
+#
+# Logic:
+#   1. Search journalctl cache for "Accepted password for USER from IP"
+#   2. Fallback to /var/log/auth.log cache
+#   3. Extract username from most recent matching entry
+#
+# Limitation:
+#   - Returns "?" untuk failed SSH attempts (no "Accepted password" log)
+#   - Returns "?" untuk scanners (no auth log entry)
+#   - Only works for IPs yang pernah auth sukses dalam 24 jam terakhir
+# ============================================================================
+resolve_user_from_ip() {
+    local ip="$1"
+    [ -z "$ip" ] && { echo "?"; return; }
+
+    # Pattern 24 v14: pakai global cache (1 call per script run)
+    fetch_journal_log
+    fetch_auth_log
+
+    local username=""
+
+    # Pattern A: SSH direct port 22 - "Accepted password for USER from IP"
+    # Dropbear via WS TIDAK relevant di bw-user (hanya port 22 SSH direct)
+    if [ -n "$JOURNAL_LOG_CACHE" ]; then
+        local match
+        match=$(printf '%s\n' "$JOURNAL_LOG_CACHE" | grep -F "from $ip" | grep -E "Accepted (password|publickey) for" | tail -1)
+        if [ -n "$match" ]; then
+            if [[ $match =~ Accepted\ password\ for\ ([a-zA-Z0-9_.-]+)\ from ]]; then
+                username="${BASH_REMATCH[1]}"
+            elif [[ $match =~ Accepted\ publickey\ for\ ([a-zA-Z0-9_.-]+)\ from ]]; then
+                username="${BASH_REMATCH[1]}"
+            fi
+        fi
+    fi
+
+    # Fallback ke /var/log/auth.log cache
+    if [ -z "$username" ] && [ -n "$AUTH_LOG_CACHE" ]; then
+        local match
+        match=$(printf '%s\n' "$AUTH_LOG_CACHE" | grep -F "from $ip" | grep -E "Accepted (password|publickey) for" | tail -1)
+        if [ -n "$match" ]; then
+            if [[ $match =~ Accepted\ password\ for\ ([a-zA-Z0-9_.-]+)\ from ]]; then
+                username="${BASH_REMATCH[1]}"
+            elif [[ $match =~ Accepted\ publickey\ for\ ([a-zA-Z0-9_.-]+)\ from ]]; then
+                username="${BASH_REMATCH[1]}"
+            fi
+        fi
+    fi
+
+    [ -n "$username" ] && echo "$username" || echo "?"
 }
 
 # --- Helper: get active SSH direct connections (port 22 only) ---
@@ -606,9 +661,15 @@ cmd_display() {
                 grep -F " $ip:" | grep -oP 'pid=\K[0-9]+' | head -1)
             [ -z "$pid_resolved" ] && pid_resolved="?"
 
-            # Resolve user via Pattern 19
+            # Resolve user: Pattern 19 (by PID) jika aktif, fallback Pattern 28 (by IP dari auth.log)
+            # FIX2-B v16: Kalau PID tidak ada di current ss (disconnected/historical),
+            # resolve username via auth.log by IP
             local username
-            username=$(resolve_user_from_pid "$pid_resolved")
+            if [ "$pid_resolved" = "?" ]; then
+                username=$(resolve_user_from_ip "$ip")
+            else
+                username=$(resolve_user_from_pid "$pid_resolved")
+            fi
             [ -z "$username" ] && username="-"
 
             # Skip system daemon users (sslh, daemon, dll) — root TIDAK difilter (admin valid, FIX1-B v16)
@@ -825,6 +886,7 @@ cmd_help() {
     echo -e "  ${GRAY}Pattern 19 (auth.log PID matching untuk resolve user)${NC}"
     echo -e "  ${GRAY}Pattern 20 (Hybrid 4-layer resolver)${NC}"
     echo -e "  ${GRAY}Pattern 24 (Global journal cache untuk performance)${NC}"
+    echo -e "  ${GRAY}Pattern 28 (resolve user by IP - fallback untuk IP disconnected)${NC}"
     echo
     pause
 }
