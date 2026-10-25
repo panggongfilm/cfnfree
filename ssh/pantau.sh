@@ -8,7 +8,9 @@
 # Tagline : DEKENG ANE BIAK BELITONG
 # Source  : Original HAXOR wrapper — konsep monitoring digabung
 #           dari script cfnfree existing (cekssh, member, tendang)
-# Version : v1.0 (Sesi 2.3 - v12)
+# Version : v1.1 (Sesi 2.4-C - v15)
+#           v1.0 (Sesi 2.3 - v12)  — base + FIX3 + Fitur 05 rework
+#           v1.1 (Sesi 2.4-C - v15) — tambah Fitur 06 (integrasi tendang-safe)
 # ============================================================
 
 # ==========================================
@@ -582,8 +584,93 @@ feat4_candidates_multilogin() {
 
     echo ""
     echo -e "${YELLOW}[!] Saran:${NC} Verifikasi manual sebelum tindakan kick."
-    echo -e "${GRAY}    Sesi 2.4 akan menambahkan opsi kick PID spesifik (tanpa restart service).${NC}"
+    echo -e "${GRAY}    Gunakan Fitur 06 untuk tendang aman (integrasi tendang-safe).${NC}"
     rm -f "$tmpfile"
+    pause
+}
+
+# ==========================================
+# FITUR 6: Tendang Aman (Integrasi tendang-safe)
+# Sesi 2.4-C - v15 (OPSI A TAHAP 2):
+#   Integrasi tendang-safe.sh ke menu monitoring pantau.
+#   Panggil /usr/bin/tendang-safe interactive mode (sub-process).
+#   Setelah exit 0X di tendang-safe, control balik ke pantau.
+#
+# Penting (Lessons v14 + Patterns v14):
+#   - tendang-safe = independent tool (v1.2, 6 opsi)
+#   - 2 Mode: Mode 1 (per-IP, ss -K dst) + Mode 2 (per-User, kill -TERM)
+#   - Mode 1 efektif untuk direct connection (port 22, 8880)
+#   - Mode 2 efektif untuk SEMUA koneksi (direct + Cloudfront/WS-TLS) — Pattern 25
+#   - Cloudfront limitation (Lesson 18): IP user asli TIDAK terlihat di port 443
+#     → Mode 1 SIA-SIA untuk Cloudfront, gunakan Mode 2
+#   - Ghost Connection (Lesson 20): TIME_WAIT socket bikin false positive JML=2
+#     → Tunggu 5-10 menit, cek lagi sebelum tendang multi-login
+#   - is_untendable_user (Pattern 26): user "-" + "unknown" + system users
+#     TIDAK boleh di-tendang (risk salah tendang)
+# ==========================================
+feat6_tendang_aman() {
+    show_header
+    echo -e "${CYAN}[*] FITUR 06: Tendang Aman (Integrasi tendang-safe)${NC}"
+    echo -e "${GRAY}--------------------------------------------------${NC}"
+    echo ""
+
+    # Validasi: tendang-safe harus ter-install di /usr/bin/tendang-safe
+    if ! command -v tendang-safe >/dev/null 2>&1; then
+        echo -e "${RED}[ERROR] Command 'tendang-safe' tidak ditemukan.${NC}"
+        echo -e "${YELLOW}    Install manual:${NC}"
+        echo -e "${GRAY}    wget -O /usr/bin/tendang-safe \\\\
+        https://raw.githubusercontent.com/panggongfilm/cfnfree/main/ssh/tendang-safe.sh${NC}"
+        echo -e "${GRAY}    chmod +x /usr/bin/tendang-safe${NC}"
+        echo ""
+        pause
+        return
+    fi
+
+    # Tampilkan info tendang-safe
+    echo -e "${CYAN}[i] tendang-safe${NC} ${GRAY}adalah tool independent untuk kick user aman${NC}"
+    echo -e "${GRAY}    (NO restart service, hanya kill PID spesifik / close socket per-IP).${NC}"
+    echo ""
+    echo -e "${YELLOW}2 Mode Operation:${NC}"
+    echo -e "  ${CYAN}Mode 1${NC} ${GRAY}(per-IP, ss -K dst <IP>):${NC}"
+    echo -e "      Efektif untuk direct connection (port 22, 8880)"
+    echo -e "  ${CYAN}Mode 2${NC} ${GRAY}(per-User, kill -TERM <PID>):${NC}"
+    echo -e "      Efektif untuk SEMUA koneksi (direct + Cloudfront/WS-TLS)"
+    echo ""
+    echo -e "${YELLOW}6 Menu Opsi:${NC}"
+    echo -e "  ${YELLOW}01${NC}) List per-IP         ${YELLOW}04${NC}) List User"
+    echo -e "  ${YELLOW}02${NC}) Tendang IP (Mode 1) ${YELLOW}05${NC}) Tendang User (Mode 2)"
+    echo -e "  ${YELLOW}03${NC}) Dry-run            ${YELLOW}06${NC}) Help"
+    echo -e "  ${YELLOW}0X${NC}) Exit ke pantau"
+    echo ""
+    echo -e "${ORANGE}[!] Penting — Cloudfront Limitation (Lesson v14):${NC}"
+    echo -e "${GRAY}    Untuk koneksi via Cloudfront (port 443), IP yang terlihat = IP AWS edge${NC}"
+    echo -e "${GRAY}    (52.46.55.x), BUKAN IP user asli. Tendang IP Cloudfront SIA-SIA.${NC}"
+    echo -e "${GRAY}    Gunakan Mode 2 (Tendang User) untuk Cloudfront path.${NC}"
+    echo ""
+    echo -e "${ORANGE}[!] Penting — Ghost Connection (Lesson v14):${NC}"
+    echo -e "${GRAY}    User yang disconnect + reconnect (ganti IP provider) meninggalkan${NC}"
+    echo -e "${GRAY}    TIME_WAIT socket ~60 detik → false positive JML=2 (bukan multi-login asli).${NC}"
+    echo -e "${GRAY}    Saran: tunggu 5-10 menit, cek lagi. Kalau masih JML=2 → tendang.${NC}"
+    echo ""
+
+    # Konfirmasi sebelum launch sub-process
+    read -r -p "${YELLOW}[?] Jalankan tendang-safe sekarang? (y/n): ${NC}" confirm
+    echo ""
+
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        echo -e "${CYAN}[*] Launching tendang-safe interactive mode...${NC}"
+        echo -e "${GRAY}    (Setelah exit 0X di tendang-safe, control balik ke pantau)${NC}"
+        echo ""
+        sleep 1
+        /usr/bin/tendang-safe
+        echo ""
+        echo -e "${CYAN}[i] tendang-safe exited. Balik ke pantau...${NC}"
+    else
+        echo -e "${GRAY}    Untuk menjalankan manual nanti, ketik: ${CYAN}tendang-safe${NC}"
+        echo -e "${GRAY}    Atau panggil dari menu utama HAXOR via opsi System Tools.${NC}"
+    fi
+
+    echo ""
     pause
 }
 
@@ -830,10 +917,11 @@ show_menu() {
         echo -e "  ${YELLOW}03${NC})  Cek Semua User & Limit IP"
         echo -e "  ${YELLOW}04${NC})  Kandidat Multi-Login ${ORANGE}(VIEW ONLY)${NC}"
         echo -e "  ${YELLOW}05${NC})  History User (1 Jam Terakhir)"
+        echo -e "  ${YELLOW}06${NC})  Tendang Aman ${ORANGE}(tendang-safe)${NC}"
         echo ""
         echo -e "  ${YELLOW}0X${NC})  Kembali ke Menu Utama HAXOR"
         echo ""
-        read -p "${GRAY}Pilih opsi [01-05 / 0X]: ${NC}" choice
+        read -p "${GRAY}Pilih opsi [01-06 / 0X]: ${NC}" choice
         handle_choice "$choice"
     done
 }
@@ -858,6 +946,9 @@ handle_choice() {
         05|5)
             feat5_history_1h
             ;;
+        06|6)
+            feat6_tendang_aman
+            ;;
         0|00|x|X|0x|0X)
             clear
             menu
@@ -865,7 +956,7 @@ handle_choice() {
         *)
             echo ""
             echo -e "${RED}[ERROR] Opsi tidak dikenal: '$1'${NC}"
-            echo -e "${YELLOW}    Pilihan valid: 01-05 atau 0X (exit)${NC}"
+            echo -e "${YELLOW}    Pilihan valid: 01-06 atau 0X (exit)${NC}"
             sleep 2
             ;;
     esac
