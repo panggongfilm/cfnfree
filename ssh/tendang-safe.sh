@@ -37,7 +37,7 @@ BG_CYAN=$'\033[48;5;24m'
 BG_TEAL=$'\033[48;5;30m'
 
 # --- Constants ---
-SCRIPT_VERSION="1.1"
+SCRIPT_VERSION="1.2"
 LOG_WINDOW="24 hours ago"
 TUNNEL_PORTS="22 109 143 443 8880"
 CACHE_FILE="/tmp/tendang-safe-candidates.cache"
@@ -45,6 +45,25 @@ CACHE_FILE_USERS="/tmp/tendang-safe-users.cache"
 
 # System users yang TIDAK boleh di-tendang (filter dari list)
 SYSTEM_USERS_FILTER="root sslh daemon nobody systemd+ sshd www-data message+ syslog usbmux dnsmasq"
+
+# --- FIX2: Global journal cache (fetched ONCE per script run) ---
+# Sebelum FIX2: journalctl dipanggil 2x per PID × N PID = 2N kali (sangat lambat)
+# FIX2: Fetch sekali, cache di variable, reuse via grep (100x lebih cepat)
+JOURNAL_LOG_CACHE=""
+AUTH_LOG_CACHE=""
+
+fetch_journal_log() {
+    if [ -z "$JOURNAL_LOG_CACHE" ] && command -v journalctl >/dev/null 2>&1; then
+        # Timeout 10 detik supaya tidak hang kalau journalctl lambat
+        JOURNAL_LOG_CACHE=$(timeout 10 journalctl --since "$LOG_WINDOW" --no-pager -o cat 2>/dev/null)
+    fi
+}
+
+fetch_auth_log() {
+    if [ -z "$AUTH_LOG_CACHE" ] && [ -f /var/log/auth.log ]; then
+        AUTH_LOG_CACHE=$(cat /var/log/auth.log 2>/dev/null)
+    fi
+}
 
 # --- Auto-detect VPS IP (untuk safety filter, jangan hardcode) ---
 detect_vps_ip() {
@@ -118,10 +137,14 @@ resolve_user() {
 
     # Layer 2: auth.log PID matching (untuk Dropbear via WebSocket)
     # Adaptasi dari cekssh.sh cfnfree - Pattern 19 v13
-    if command -v journalctl >/dev/null 2>&1; then
+    # FIX2: Pakai cache (fetch_journal_log + fetch_auth_log) supaya tidak panggil
+    # journalctl 30x untuk 15 PID (sangat lambat → timeout → resolve return "-")
+    local log_user=""
+
+    fetch_journal_log
+    if [ -n "$JOURNAL_LOG_CACHE" ]; then
         local log_line
-        log_line=$(journalctl --since "$LOG_WINDOW" --no-pager -o cat 2>/dev/null | \
-                   grep -E "\[$pid\]" | \
+        log_line=$(echo "$JOURNAL_LOG_CACHE" | grep -E "\[$pid\]" | \
                    grep -E "(Password auth succeeded|Accepted password for|Accepted publickey for)" | \
                    tail -1)
         if [ -n "$log_line" ]; then
@@ -132,6 +155,25 @@ resolve_user() {
             fi
             # SSH: "sshd[PID]: Accepted password for USER from IP PORT ssh2"
             if [[ $log_line =~ Accepted\ (password|publickey)\ for\ ([a-zA-Z0-9_.-]+)\ from ]]; then
+                user="${BASH_REMATCH[2]}"
+                [ -n "$user" ] && { echo "$user"; return; }
+            fi
+        fi
+    fi
+
+    # Path B: Fallback ke /var/log/auth.log (CACHED)
+    fetch_auth_log
+    if [ -n "$AUTH_LOG_CACHE" ]; then
+        local log_line2
+        log_line2=$(echo "$AUTH_LOG_CACHE" | grep -E "\[$pid\]" | \
+                    grep -E "(Password auth succeeded|Accepted password for|Accepted publickey for)" | \
+                    tail -1)
+        if [ -n "$log_line2" ]; then
+            if [[ $log_line2 =~ Password\ auth\ succeeded\ for\ \'([^\']+)\' ]]; then
+                user="${BASH_REMATCH[1]}"
+                [ -n "$user" ] && { echo "$user"; return; }
+            fi
+            if [[ $log_line2 =~ Accepted\ (password|publickey)\ for\ ([a-zA-Z0-9_.-]+)\ from ]]; then
                 user="${BASH_REMATCH[2]}"
                 [ -n "$user" ] && { echo "$user"; return; }
             fi
@@ -360,11 +402,28 @@ cmd_kick() {
 }
 
 # --- Helper: cek apakah user adalah system user (filter dari list) ---
+# FIX2: Hapus "-" dari filter supaya user unresolved TETAP tampil di opsi 04 List User
+# (transparency - admin bisa lihat PID tanpa nama, untuk investigasi manual)
+# Filter hanya system users yang jelas-jelas bukan user tunneling
 is_system_user() {
     local user=$1
     case "$user" in
-        root|sslh|daemon|nobody|sshd|www-data|syslog|dnsmasq|usbmux|message+|systemd+|"-"|"")
+        root|sslh|daemon|nobody|sshd|www-data|syslog|dnsmasq|usbmux|message+|systemd+|"")
             return 0 ;;
+    esac
+    return 1
+}
+
+# --- Helper: cek apakah user TIDAK bisa di-tendang (lebih strict dari is_system_user) ---
+# Dipakai di cmd_kick_user untuk safety (jangan tendang user yang tidak resolve nama)
+is_untendable_user() {
+    local user=$1
+    if is_system_user "$user"; then
+        return 0
+    fi
+    # FIX2: user "-" atau "unknown" TIDAK boleh di-tendang (tidak ada nama jelas)
+    case "$user" in
+        -|unknown|"") return 0 ;;
     esac
     return 1
 }
@@ -543,10 +602,11 @@ cmd_kick_user() {
         fi
     fi
 
-    # Safety: reject system users
-    if is_system_user "$target_user"; then
+    # Safety: reject system users + unresolved (FIX2: tambah is_untendable_user)
+    if is_untendable_user "$target_user"; then
         echo
-        echo -e "${RED}ERROR: User '$target_user' TIDAK boleh di-tendang (system user / protected).${NC}"
+        echo -e "${RED}ERROR: User '$target_user' TIDAK boleh di-tendang (system user / unresolved / protected).${NC}"
+        echo -e "${GRAY}(User '-', 'unknown', atau system users tidak bisa di-tendang karena nama tidak jelas)${NC}"
         pause
         return 1
     fi
