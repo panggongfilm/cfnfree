@@ -1,17 +1,21 @@
 #!/bin/bash
 # ============================================================================
 # Script  : tendang-safe.sh
-# Version : 1.0 (Sesi v14 - Sesi 2.4-A Kick Aman)
+# Version : 1.1 (Sesi v14 - Sesi 2.4-A Kick Aman + FIX1 Tendang User)
 # Purpose : Tendang koneksi user SSH/Dropbear/WebSocket secara AMAN
-#           Targeted per-IP (kernel-level ss -K), NO restart service
-#           Anti pattern tendang.sh DESTRUCTIVE (restart SSH+Dropbear)
-# Source  : Original HAXOR wrapper - Pattern 1 jembatan 13D (ss -K dst <ip>)
-#           Adaptasi resolve_user dari pantau.sh v13 (Pattern 19: auth.log PID)
+#           Mode 1: Targeted per-IP (kernel-level ss -K) - untuk direct conn
+#           Mode 2: Kill PID per-User (Dropbear child) - untuk Cloudfront/WS-TLS
+#           NO restart service (anti pattern tendang.sh DESTRUCTIVE)
+# Source  : Original HAXOR wrapper
+#           - Pattern 1 jembatan 13D (ss -K dst <ip>) untuk Mode 1
+#           - Pattern 19 v13 (auth.log PID matching) untuk resolve user
 # Brand   : HAXOR + Tagline "DEKENG ANE BIAK BELITONG"
 # Usage   : tendang-safe                    (interactive menu, recommended)
-#           tendang-safe --list             (CLI: list kandidat)
+#           tendang-safe --list             (CLI: list kandidat per-IP)
+#           tendang-safe --list-users       (CLI: list user aktif + PID)
 #           tendang-safe --kick <IP>        (CLI: tendang IP dgn konfirmasi)
-#           tendang-safe --dry-run <IP>     (CLI: simulasi, no execute)
+#           tendang-safe --kick-user <USER> (CLI: tendang user (kill PID))
+#           tendang-safe --dry-run <IP>     (CLI: simulasi tendang IP)
 #           tendang-safe --help             (CLI: tampilkan help)
 # ============================================================================
 
@@ -33,10 +37,14 @@ BG_CYAN=$'\033[48;5;24m'
 BG_TEAL=$'\033[48;5;30m'
 
 # --- Constants ---
-SCRIPT_VERSION="1.0"
+SCRIPT_VERSION="1.1"
 LOG_WINDOW="24 hours ago"
 TUNNEL_PORTS="22 109 143 443 8880"
 CACHE_FILE="/tmp/tendang-safe-candidates.cache"
+CACHE_FILE_USERS="/tmp/tendang-safe-users.cache"
+
+# System users yang TIDAK boleh di-tendang (filter dari list)
+SYSTEM_USERS_FILTER="root sslh daemon nobody systemd+ sshd www-data message+ syslog usbmux dnsmasq"
 
 # --- Auto-detect VPS IP (untuk safety filter, jangan hardcode) ---
 detect_vps_ip() {
@@ -351,6 +359,262 @@ cmd_kick() {
     pause
 }
 
+# --- Helper: cek apakah user adalah system user (filter dari list) ---
+is_system_user() {
+    local user=$1
+    case "$user" in
+        root|sslh|daemon|nobody|sshd|www-data|syslog|dnsmasq|usbmux|message+|systemd+|"-"|"")
+            return 0 ;;
+    esac
+    return 1
+}
+
+# --- Helper: list user aktif dengan PID mereka ---
+# Output (stdout): user|count|pids (comma-separated) per baris
+# Source: ALL tunnel ports (22, 109, 143, 443, 8880) - TERMASUK loopback Cloudfront path
+# Filter: skip root + system users + user tidak resolve
+get_active_users() {
+    declare -A user_pids
+    declare -A user_count
+
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+
+        local local_addr_port peer_addr_port
+        local_addr_port=$(echo "$line" | awk '{print $3}')
+        peer_addr_port=$(echo "$line" | awk '{print $4}')
+        [ -z "$local_addr_port" ] && continue
+        [ -z "$peer_addr_port" ] && continue
+
+        local local_port
+        local_port="${local_addr_port##*:}"
+
+        # Hanya tunnel ports (INCLUDE 109/143 untuk Cloudfront path via Dropbear child)
+        case "$local_port" in
+            22|109|143|443|8880) ;;
+            *) continue ;;
+        esac
+
+        # Extract PID
+        local pid
+        if [[ $line =~ pid=([0-9]+) ]]; then
+            pid="${BASH_REMATCH[1]}"
+        else
+            continue
+        fi
+
+        # Resolve user via Pattern 19
+        local user
+        user=$(resolve_user "$pid")
+
+        # Filter system users + tidak resolve
+        is_system_user "$user" && continue
+
+        # Aggregate by user
+        if [ -z "${user_count[$user]}" ]; then
+            user_count[$user]=1
+            user_pids[$user]="$pid"
+        else
+            user_count[$user]=$((${user_count[$user]}+1))
+            user_pids[$user]="${user_pids[$user]},$pid"
+        fi
+    done < <(ss -tnpH state established 2>/dev/null)
+
+    # Output: user|count|pids (sorted by user)
+    for user in "${!user_count[@]}"; do
+        echo "${user}|${user_count[$user]}|${user_pids[$user]}"
+    done | sort
+}
+
+# --- Helper: get fresh PID list for a specific user (real-time) ---
+# Output (stdout): PID per baris
+get_user_pids() {
+    local target_user=$1
+    [ -z "$target_user" ] && return
+
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+
+        local local_addr_port
+        local_addr_port=$(echo "$line" | awk '{print $3}')
+        local local_port="${local_addr_port##*:}"
+
+        case "$local_port" in
+            22|109|143|443|8880) ;;
+            *) continue ;;
+        esac
+
+        local pid
+        if [[ $line =~ pid=([0-9]+) ]]; then
+            pid="${BASH_REMATCH[1]}"
+        else
+            continue
+        fi
+
+        local u
+        u=$(resolve_user "$pid")
+        if [ "$u" = "$target_user" ]; then
+            echo "$pid"
+        fi
+    done < <(ss -tnpH state established 2>/dev/null)
+}
+
+# --- Command: --list-users (CLI + interactive) ---
+cmd_list_users() {
+    local users
+    users=$(get_active_users)
+
+    if [ -z "$users" ]; then
+        echo "Tidak ada user aktif yang bisa di-tendang."
+        return 1
+    fi
+
+    # Save to cache for later kick-user reference
+    echo "$users" > "$CACHE_FILE_USERS"
+
+    printf "%-4s %-22s %-8s %-50s\n" "No." "USERNAME" "JML" "PID LIST"
+    printf "%-4s %-22s %-8s %-50s\n" "----" "----------------------" "--------" "--------------------------------------------------"
+
+    local idx=0
+    while IFS='|' read -r user count pids; do
+        idx=$((idx+1))
+        printf "%-4s %-22s %-8s %-50s\n" "$idx" "$user" "$count" "$pids"
+    done <<< "$users"
+
+    echo
+    echo "Total: $idx user"
+}
+
+cmd_list_users_interactive() {
+    show_header
+    echo -e "${YELLOW}User aktif yang bisa di-tendang (kill PID per-user):${NC}"
+    echo
+    cmd_list_users
+    pause
+}
+
+# --- Command: --kick-user <USER> (CLI + interactive) ---
+# Mode 2: Kill Dropbear child PID per-user (untuk Cloudfront/WS-TLS path)
+cmd_kick_user() {
+    local target_user=$1
+
+    # Interactive: list + ask (kalau tanpa argumen)
+    if [ -z "$target_user" ]; then
+        show_header
+        local users
+        users=$(get_active_users)
+
+        if [ -z "$users" ]; then
+            echo -e "${GRAY}Tidak ada user aktif yang bisa di-tendang.${NC}"
+            pause
+            return 1
+        fi
+
+        # Save to cache
+        echo "$users" > "$CACHE_FILE_USERS"
+
+        echo -e "${YELLOW}User aktif yang bisa di-tendang:${NC}"
+        echo
+        printf "%-4s %-22s %-8s %-50s\n" "No." "USERNAME" "JML" "PID LIST"
+        printf "%-4s %-22s %-8s %-50s\n" "----" "----------------------" "--------" "--------------------------------------------------"
+
+        local idx=0
+        declare -a user_map
+        while IFS='|' read -r user count pids; do
+            idx=$((idx+1))
+            user_map[$idx]="$user"
+            printf "%-4s %-22s %-8s %-50s\n" "$idx" "$user" "$count" "$pids"
+        done <<< "$users"
+
+        echo
+        echo -e "${YELLOW}Total: $idx user${NC}"
+        echo
+        read -p "${GRAY}Masukkan nomor user (atau ketik username, atau 0 untuk batal): ${NC}" input
+
+        if [ "$input" = "0" ] || [ -z "$input" ]; then
+            return 1
+        fi
+
+        # Resolve input ke username (nomor atau langsung username)
+        if [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -ge 1 ] 2>/dev/null && [ "$input" -le "$idx" ] 2>/dev/null; then
+            target_user="${user_map[$input]}"
+        else
+            target_user="$input"  # Assume user type username langsung
+        fi
+    fi
+
+    # Safety: reject system users
+    if is_system_user "$target_user"; then
+        echo
+        echo -e "${RED}ERROR: User '$target_user' TIDAK boleh di-tendang (system user / protected).${NC}"
+        pause
+        return 1
+    fi
+
+    # Get FRESH PID list (real-time, kalau-kalau list cache sudah berubah)
+    local fresh_pids=()
+    while IFS= read -r pid; do
+        [ -n "$pid" ] && fresh_pids+=("$pid")
+    done < <(get_user_pids "$target_user")
+
+    if [ ${#fresh_pids[@]} -eq 0 ]; then
+        echo
+        echo -e "${RED}ERROR: Tidak ada PID aktif untuk user '$target_user'.${NC}"
+        echo -e "${GRAY}(User mungkin sudah disconnect, atau username salah)${NC}"
+        pause
+        return 1
+    fi
+
+    # Show preview
+    show_header
+    echo -e "${YELLOW}Tendang User: $target_user${NC}"
+    echo
+    echo -e "${CYAN}PID yang akan di-kill (${#fresh_pids[@]} PID):${NC}"
+    for p in "${fresh_pids[@]}"; do
+        local args
+        args=$(ps -p "$p" -o args= 2>/dev/null)
+        echo "  ${GREEN}PID $p${NC}: $args"
+    done
+    echo
+
+    # Confirm - HARUS ketik "YA" (huruf besar)
+    echo -e "${RED}PERINGATAN: User '$target_user' akan disconnect dari SEMUA perangkat.${NC}"
+    echo -e "${RED}User bisa reconnect kapan saja (Dropbear master tetap jalan, NO restart service).${NC}"
+    echo
+    read -p "${YELLOW}Ketik 'YA' (huruf besar) untuk konfirmasi tendang user '$target_user': ${NC}" confirm
+
+    if [ "$confirm" != "YA" ]; then
+        echo
+        echo -e "${GRAY}Dibatalkan.${NC}"
+        pause
+        return 1
+    fi
+
+    # Execute kill -TERM for each PID (SIGTERM = graceful, lebih aman dari SIGKILL)
+    echo
+    echo -e "${CYAN}Menjalankan kill -TERM untuk ${#fresh_pids[@]} PID...${NC}"
+    local killed=0
+    local failed=0
+    for p in "${fresh_pids[@]}"; do
+        if kill -TERM "$p" 2>/dev/null; then
+            echo -e "  ${GREEN}✓ PID $p di-kill${NC}"
+            killed=$((killed+1))
+        else
+            echo -e "  ${RED}✗ PID $p gagal di-kill (mungkin sudah exit)${NC}"
+            failed=$((failed+1))
+        fi
+    done
+
+    echo
+    echo -e "${GREEN}Selesai.${NC}"
+    echo -e "  ${GREEN}Killed: $killed PID${NC}"
+    [ $failed -gt 0 ] && echo -e "  ${ORANGE}Failed: $failed PID${NC}"
+    echo
+    echo -e "${GRAY}User '$target_user' akan disconnect dalam 1-3 detik.${NC}"
+    echo -e "${GRAY}Dropbear master tetap listening, user bisa reconnect kapan saja.${NC}"
+    pause
+}
+
 # --- Command: --dry-run <IP> (CLI + interactive) ---
 cmd_dry_run() {
     local target_ip=$1
@@ -394,20 +658,33 @@ cmd_help() {
     echo
     echo -e "${CYAN}Usage:${NC}"
     echo "  tendang-safe                       Interactive menu (recommended)"
-    echo "  tendang-safe --list                List kandidat yang bisa di-tendang"
-    echo "  tendang-safe --kick <IP>           Tendang IP (dengan konfirmasi 'YA')"
-    echo "  tendang-safe --dry-run <IP>        Simulasi tendang (no execute)"
+    echo "  tendang-safe --list                List kandidat per-IP (direct connection)"
+    echo "  tendang-safe --list-users          List user aktif + PID mereka"
+    echo "  tendang-safe --kick <IP>           Tendang IP (Mode 1: ss -K, untuk direct conn)"
+    echo "  tendang-safe --kick-user <USER>    Tendang user (Mode 2: kill PID, untuk Cloudfront)"
+    echo "  tendang-safe --dry-run <IP>        Simulasi tendang IP (no execute)"
     echo "  tendang-safe --help                Tampilkan help ini"
     echo "  tendang-safe --version             Tampilkan versi"
     echo
+    echo -e "${CYAN}Mode 1 (per-IP, ss -K dst <IP>):${NC}"
+    echo "  Efektif untuk: SSH direct (port 22), WS-NonTLS (port 8880)"
+    echo "  Limitation: TIDAK efektif untuk Cloudfront/WS-TLS (port 443 via sslh)"
+    echo "  Karena IP yang terlihat = IP Cloudfront, BUKAN IP user asli"
+    echo
+    echo -e "${CYAN}Mode 2 (per-User, kill PID):${NC}"
+    echo "  Efektif untuk: SEMUA jenis koneksi (direct + Cloudfront/WS-TLS)"
+    echo "  Kill Dropbear child PID spesifik milik user (NO restart service)"
+    echo "  User disconnect 1-3 detik, bisa reconnect kapan saja"
+    echo
     echo -e "${CYAN}Safety:${NC}"
     echo "  - 127.0.0.1, IP VPS sendiri ($VPS_IP), IP private TIDAK boleh di-tendang"
-    echo "  - User 'root' TIDAK di-list sebagai kandidat (filter)"
+    echo "  - User 'root' + system users (sslh, daemon, dll) TIDAK di-list (filter)"
     echo "  - Konfirmasi 'YA' (huruf besar) WAJIB sebelum execute"
     echo
     echo -e "${CYAN}Method:${NC}"
-    echo "  ss -K dst <IP>  (kernel-level, targeted per-IP, NO restart service)"
-    echo "  Pattern 1 jembatan 13D - anti tendang.sh DESTRUCTIVE"
+    echo "  Mode 1: ss -K dst <IP>  (kernel-level, targeted per-IP)"
+    echo "  Mode 2: kill -TERM <PID>  (Dropbear child, graceful)"
+    echo "  Pattern 1 jembatan 13D - anti tendang.sh DESTRUCTIVE (NO restart service)"
     echo
     echo -e "${CYAN}Source:${NC}"
     echo "  Original HAXOR wrapper - Pattern 1 jembatan 13D (ss -K dst <ip>)"
@@ -421,14 +698,16 @@ show_menu() {
         show_header
         echo -e "${CYAN}Pilih opsi:${NC}"
         echo
-        echo -e "  ${YELLOW}01${NC}) List Kandidat Tendang"
-        echo -e "  ${YELLOW}02${NC}) Tendang IP (dengan konfirmasi)"
-        echo -e "  ${YELLOW}03${NC}) Dry-Run Tendang IP (simulasi)"
-        echo -e "  ${YELLOW}04${NC}) Help"
+        echo -e "  ${YELLOW}01${NC}) List Kandidat Tendang (per-IP)"
+        echo -e "  ${YELLOW}02${NC}) Tendang IP (Mode 1: ss -K, direct conn)"
+        echo -e "  ${YELLOW}03${NC}) Dry-Run Tendang IP (simulasi Mode 1)"
+        echo -e "  ${YELLOW}04${NC}) List User Aktif (per-User)"
+        echo -e "  ${YELLOW}05${NC}) Tendang User (Mode 2: kill PID, Cloudfront OK)"
+        echo -e "  ${YELLOW}06${NC}) Help"
         echo
         echo -e "  ${ORANGE}0X${NC}) Kembali / Exit"
         echo
-        read -p "${GRAY}Pilih opsi [01-04 / 0X]: ${NC}" choice
+        read -p "${GRAY}Pilih opsi [01-06 / 0X]: ${NC}" choice
 
         case "$choice" in
             01|1)
@@ -443,6 +722,12 @@ show_menu() {
                 cmd_dry_run "$target_ip"
                 ;;
             04|4)
+                cmd_list_users_interactive
+                ;;
+            05|5)
+                cmd_kick_user
+                ;;
+            06|6)
                 cmd_help
                 pause
                 ;;
@@ -531,8 +816,14 @@ main() {
         --list)
             cmd_list
             ;;
+        --list-users)
+            cmd_list_users
+            ;;
         --kick)
             cmd_kick "$2"
+            ;;
+        --kick-user)
+            cmd_kick_user "$2"
             ;;
         --dry-run)
             cmd_dry_run "$2"
@@ -542,14 +833,15 @@ main() {
             ;;
         --version|-V)
             echo "tendang-safe v$SCRIPT_VERSION (HAXOR Panel Tunneling - Sesi v14 Sesi 2.4-A)"
-            echo "Pattern 1 jembatan 13D (ss -K dst <ip>)"
+            echo "Mode 1: Pattern 1 jembatan 13D (ss -K dst <ip>)"
+            echo "Mode 2: Kill PID per-User (Pattern 19 v13 + Dropbear child)"
             ;;
         "")
             show_menu
             ;;
         *)
             echo "Unknown command: $1"
-            echo "Usage: tendang-safe --list|--kick <IP>|--dry-run <IP>|--help|--version"
+            echo "Usage: tendang-safe --list|--list-users|--kick <IP>|--kick-user <USER>|--dry-run <IP>|--help|--version"
             echo "       atau 'tendang-safe' (interactive mode)"
             exit 1
             ;;
