@@ -53,8 +53,10 @@ ACCUM_DIR="${BANDWIDTH_DIR}/accum"
 CRON_FILE="/etc/cron.d/bw-user"
 LOG_WINDOW="24 hours ago"
 
-# System users yang TIDAK dihitung (filter dari display)
-SYSTEM_USERS_FILTER="root sslh daemon nobody systemd+ sshd www-data message+ syslog usbmux dnsmasq"
+# System daemon users yang TIDAK dihitung (filter dari display)
+# FIX1-B v16: Hapus "root" dari filter — root adalah admin yang valid, bandwidth root harus dihitung
+# Filter hanya untuk system daemon (sslh, daemon, nobody, dll), BUKAN untuk root user login
+SYSTEM_USERS_FILTER="sslh daemon nobody systemd+ sshd www-data message+ syslog usbmux dnsmasq"
 
 # --- FIX2 v14: Global journal cache (fetched ONCE per script run) ---
 # Pattern 24 v14: Fetch journalctl log 1x, reuse via grep (100x lebih cepat)
@@ -533,10 +535,13 @@ cmd_snap() {
         }
     ' | while IFS='|' read -r ip in_bytes; do
         # Find matching out_bytes from OUTPUT chain
+        # FIX1-A v16: OUTPUT chain pakai $9 (destination IP), BUKAN $8 (source = 0.0.0.0/0)
+        # Format OUTPUT: pkts bytes target prot opt in out source destination
+        # Rule ditambahkan dengan -d <ip> jadi destination = IP user
         local out_bytes=0
         out_bytes=$(iptables -L "$CHAIN_OUT" -v -n -x 2>/dev/null | awk -v ip="$ip" '
             /^ *[0-9]+ +[0-9]+ +RETURN/ {
-                if ($8 == ip) print $2
+                if ($9 == ip) print $2
             }
         ' | head -1)
         out_bytes=${out_bytes:-0}
@@ -606,7 +611,7 @@ cmd_display() {
             username=$(resolve_user_from_pid "$pid_resolved")
             [ -z "$username" ] && username="-"
 
-            # Skip system users (root, sslh, daemon, dll)
+            # Skip system daemon users (sslh, daemon, dll) — root TIDAK difilter (admin valid, FIX1-B v16)
             local is_system=0
             for sys_user in $SYSTEM_USERS_FILTER; do
                 if [ "$username" = "$sys_user" ]; then
