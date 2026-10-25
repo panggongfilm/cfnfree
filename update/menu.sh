@@ -2,20 +2,24 @@
 #
 # ============================================================
 # Script   : menu.sh
-# Version  : 2.0 (Sesi 1.5 — Redesign penuh)
+# Version  : 3.0 (Sesi 2.6 — v18: Integrate pantau + tendang-safe + bw-user)
 # Repo     : panggongfilm/cfnfree
 # Path     : /update/menu.sh (di repo) → /usr/bin/menu (di VPS)
 # Brand    : HAXOR PANEL TUNNELING
 # Tagline  : DEKENG ANE BIAK BELITONG
-# Source   : Redesign dari menu.sh v1.0 (panggongfilm/cfnfree)
+# Source   : Redesign dari menu.sh v2.0-FIX2 (panggongfilm/cfnfree)
 # ============================================================
 #
 # Deskripsi:
-#   Menu utama HAXOR Panel — 12 item layout 2-kolom
-#   (SSH MANAGEMENT | SYSTEM TOOLS). Re-entrant via while-loop.
-#   Integrate 4 utility Fase 1 (bw, speedtest-haxor, clearlog,
-#   clearcache) + htop + reboot (dengan confirmation) + exit
-#   (dengan confirmation).
+#   Menu utama HAXOR Panel — 14 item layout 2-kolom
+#   (SSH MANAGEMENT 6 item | MONITORING & TOOLS 8 item).
+#   Re-entrant via while-loop. Integrate:
+#     - 6 SSH management (maddssh, sslh-fix-reboot, mbackup, msetting,
+#       start-menu, reboot_vps dengan confirmation)
+#     - 3 utility Fase 1 (bw, speedtest-haxor, clearlog, clearcache)
+#     - 3 script Fase 2 (pantau, tendang-safe, bw-user)
+#     - htop system monitor
+#   Exit = 0X universal (tanpa nomor, anti salah pencet).
 #
 # Pelajaran penting yang diterapkan:
 #   - ANSI-C quoting $'...' untuk semua variabel palette
@@ -25,6 +29,10 @@
 #     menghindari stack growth saat user pakai menu lama
 #   - Confirmation prompt untuk opsi destruktif (reboot, exit)
 #     — pattern run-once confirm dari v7/v8
+#   - Exit = 0X universal (tanpa nomor, keputusan user v18)
+#     — anti salah pencet (user tidak akan ketik 12/15/16 thinking exit)
+#   - Layout 2-kolom 6+8 (BUKAN 3-kolom) — anti susah dibaca di HP
+#     (keputusan user v18)
 #
 # ============================================================
 
@@ -52,23 +60,29 @@ show_menu() {
     while true; do
         clear
         # ─── Header box (double-bar BG_CYAN + BG_TEAL) ───
-        # Konsisten dengan bw.sh / speedtest-haxor.sh / clearlog.sh / clearcache.sh
+        # Konsisten dengan bw.sh / speedtest-haxor.sh / clearlog.sh / clearcache.sh / pantau.sh / tendang-safe.sh / bw-user.sh
         echo -e "${DGRAY}══════════════════════════════════════════════════════════════════════════${NC}"
         echo -e "${BG_CYAN}${WHITE}                       HAXOR PANEL TUNNELING — MAIN MENU                     ${NC}"
         echo -e "${BG_TEAL}${WHITE}                          DEKENG ANE BIAK BELITONG                          ${NC}"
         echo -e "${DGRAY}══════════════════════════════════════════════════════════════════════════${NC}"
         echo
 
-        # ─── Body: 2-kolom (SSH MANAGEMENT | SYSTEM TOOLS) ───
-        # printf %-Ns untuk auto-padding (ANSI codes TIDAK mempengaruhi width)
-        echo -e "${DGRAY}┌─${NC} ${CYAN}SSH MANAGEMENT${NC} ${DGRAY}────────────────┬─${NC} ${TEAL}SYSTEM TOOLS${NC} ${DGRAY}───────────────┐${NC}"
-        printf "${DGRAY}│${NC}  ${YELLOW}[%s]${NC} %-22s ${DGRAY}│${NC}  ${YELLOW}[%s]${NC} %-22s ${DGRAY}│${NC}\n" "01" "SSH Account Menu"   "07" "Cek RAM/CPU (htop)"
-        printf "${DGRAY}│${NC}  ${YELLOW}[%s]${NC} %-22s ${DGRAY}│${NC}  ${YELLOW}[%s]${NC} %-22s ${DGRAY}│${NC}\n" "02" "Restart Service"    "08" "Cek Bandwidth (bw)"
-        printf "${DGRAY}│${NC}  ${YELLOW}[%s]${NC} %-22s ${DGRAY}│${NC}  ${YELLOW}[%s]${NC} %-22s ${DGRAY}│${NC}\n" "03" "Backup & Restore"   "09" "Speedtest VPS"
-        printf "${DGRAY}│${NC}  ${YELLOW}[%s]${NC} %-22s ${DGRAY}│${NC}  ${YELLOW}[%s]${NC} %-22s ${DGRAY}│${NC}\n" "04" "Settings"           "10" "Clear Log"
-        printf "${DGRAY}│${NC}  ${YELLOW}[%s]${NC} %-22s ${DGRAY}│${NC}  ${YELLOW}[%s]${NC} %-22s ${DGRAY}│${NC}\n" "05" "Cek Service"        "11" "Clear Cache"
-        printf "${DGRAY}│${NC}  ${YELLOW}[%s]${NC} %-22s ${DGRAY}│${NC}  ${YELLOW}[%s]${NC} %-22s ${DGRAY}│${NC}\n" "06" "Reboot VPS"         "12" "Exit"
+        # ─── Body: 2-kolom (SSH MANAGEMENT 6 | MONITORING & TOOLS 8) ───
+        # printf %-Ns untuk auto-padding (ANSI codes TIDAK mempengaruhi width — Lesson v6 FIX1)
+        # Kolom kiri = 6 item (01-06), kolom kanan = 8 item (07-14)
+        # Baris 7-8: kolom kiri kosong (placeholder whitespace) supaya border konsisten
+        echo -e "${DGRAY}┌─${NC} ${CYAN}SSH MANAGEMENT${NC} ${DGRAY}────────────────┬─${NC} ${TEAL}MONITORING & TOOLS${NC} ${DGRAY}──────────┐${NC}"
+        printf "${DGRAY}│${NC}  ${YELLOW}[%s]${NC} %-22s ${DGRAY}│${NC}  ${YELLOW}[%s]${NC} %-22s ${DGRAY}│${NC}\n" "01" "SSH Account Menu"     "07" "Cek RAM/CPU (htop)"
+        printf "${DGRAY}│${NC}  ${YELLOW}[%s]${NC} %-22s ${DGRAY}│${NC}  ${YELLOW}[%s]${NC} %-22s ${DGRAY}│${NC}\n" "02" "Restart Service"      "08" "Bandwidth VPS (bw)"
+        printf "${DGRAY}│${NC}  ${YELLOW}[%s]${NC} %-22s ${DGRAY}│${NC}  ${YELLOW}[%s]${NC} %-22s ${DGRAY}│${NC}\n" "03" "Backup & Restore"     "09" "Speedtest VPS"
+        printf "${DGRAY}│${NC}  ${YELLOW}[%s]${NC} %-22s ${DGRAY}│${NC}  ${YELLOW}[%s]${NC} %-22s ${DGRAY}│${NC}\n" "04" "Settings"             "10" "Bandwidth Per-User"
+        printf "${DGRAY}│${NC}  ${YELLOW}[%s]${NC} %-22s ${DGRAY}│${NC}  ${YELLOW}[%s]${NC} %-22s ${DGRAY}│${NC}\n" "05" "Cek Service"          "11" "Pantau User"
+        printf "${DGRAY}│${NC}  ${YELLOW}[%s]${NC} %-22s ${DGRAY}│${NC}  ${YELLOW}[%s]${NC} %-22s ${DGRAY}│${NC}\n" "06" "Reboot VPS"           "12" "Tendang Aman"
+        printf "${DGRAY}│${NC}  ${YELLOW}%-2s${NC}  %-22s ${DGRAY}│${NC}  ${YELLOW}[%s]${NC} %-22s ${DGRAY}│${NC}\n" "  " ""                     "13" "Clear Log"
+        printf "${DGRAY}│${NC}  ${YELLOW}%-2s${NC}  %-22s ${DGRAY}│${NC}  ${YELLOW}[%s]${NC} %-22s ${DGRAY}│${NC}\n" "  " ""                     "14" "Clear Cache"
         echo -e "${DGRAY}└──────────────────────────────────┴──────────────────────────────────┘${NC}"
+        echo
+        printf "                       ${PINK}[0X]${NC} ${WHITE}Exit${NC}\n"
         echo
 
         # ─── Footer (BELITONG + Mod By HAXOR) ───
@@ -78,7 +92,7 @@ show_menu() {
         echo
 
         # ─── Read user input (prompt berwarna, ANSI-C quoting) ───
-        read -p "${YELLOW}  Pilih opsi [01-12 / 0X untuk keluar]: ${NC}" opt
+        read -p "${YELLOW}  Pilih opsi [01-14 / 0X untuk keluar]: ${NC}" opt
         handle_choice "$opt"
         # Setelah handle_choice selesai (non-exit), loop continues → menu baru
     done
@@ -132,18 +146,33 @@ handle_choice() {
             speedtest-haxor
             ;;
         10)
-            clearlog
+            bw-user
             ;;
         11)
+            clear
+            pantau
+            echo
+            read -p "${GRAY}  Tekan enter untuk kembali ke menu utama...${NC}" dummy
+            ;;
+        12)
+            clear
+            tendang-safe
+            echo
+            read -p "${GRAY}  Tekan enter untuk kembali ke menu utama...${NC}" dummy
+            ;;
+        13)
+            clearlog
+            ;;
+        14)
             clearcache
             ;;
-        12|0|00|x|X|0x|0X)
+        0|00|x|X|0x|0X)
             exit_script
             ;;
         *)
             echo
             echo -e "  ${RED}[ERROR]${NC} ${WHITE}Opsi tidak dikenal: '${YELLOW}${choice}${NC}${WHITE}'.${NC}"
-            echo -e "  ${GRAY}Silakan pilih 01-12 atau 0X untuk keluar.${NC}"
+            echo -e "  ${GRAY}Silakan pilih 01-14 atau 0X untuk keluar.${NC}"
             sleep 2
             ;;
     esac
