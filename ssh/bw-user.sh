@@ -349,6 +349,14 @@ resolve_user_from_ip() {
 # Scan ss untuk Dropbear child (port 109/143) + sshd (port 22) PID yang established
 # Output: list of "pid" per line (filtered: skip loopback, VPS IP, protected IP)
 # Adaptasi dari get_active_connections pantau.sh + tendang-safe.sh
+#
+# FIX1 v17 (Sesi 2.5-B): Pisahkan filter berdasarkan local_port
+# - Port 22 (sshd): peer IP harus public (skip 127.0.0.1, VPS IP, private range)
+#   karena sshd peer = IP user asli (BUKAN loopback)
+# - Port 109/143 (Dropbear child): JANGAN filter peer IP, karena peer SELALU
+#   127.0.0.1 (loopback dari sslh/python WS proxy) — ini karakteristik arsitektur
+#   Cloudfront/WS-TLS/WS-NonTLS. User resolve via Pattern 19 (auth.log PID matching),
+#   BUKAN via peer IP.
 # ============================================================================
 get_active_tunneling_pids() {
     ss -tnpH state established 2>/dev/null | while IFS= read -r line; do
@@ -387,7 +395,7 @@ get_active_tunneling_pids() {
         esac
         [ "$is_target" -eq 0 ] && continue
 
-        # Extract peer IP (untuk filter loopback/VPS IP)
+        # Extract peer IP
         local peer_ip=""
         if [ -n "$peer_addr" ]; then
             peer_ip="${peer_addr%:*}"
@@ -395,8 +403,14 @@ get_active_tunneling_pids() {
             peer_ip="${peer_ip%]}"
         fi
 
-        # Skip protected IP (loopback, VPS IP, private range)
-        is_protected_ip "$peer_ip" && continue
+        # FIX1 v17: Conditional filter berdasarkan local_port
+        # - Port 22 (sshd): filter protected IP (peer harus public, BUKAN loopback)
+        # - Port 109/143 (Dropbear child): JANGAN filter (peer 127.0.0.1 itu normal)
+        if [ "$local_port" = "22" ]; then
+            is_protected_ip "$peer_ip" && continue
+        fi
+        # Port 109/143: skip only if peer is empty (race condition)
+        [ -z "$peer_ip" ] && continue
 
         echo "$pid"
     done
