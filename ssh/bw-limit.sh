@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================================
 # Script : bw-limit.sh
-# Version : v1.0 (Sesi 2.8-A - v27)
+# Version : v1.0-FIX1 (Sesi 2.8-A - v27)
 # Brand  : HAXOR TUNNELING
 # Tagline: DEKENG ANE BIAK BELITONG
 # Source : Original HAXOR wrapper - Pattern 36+37+38+39 v26
@@ -69,7 +69,7 @@ BG_CYAN=$'\033[48;5;24m'
 BG_TEAL=$'\033[48;5;30m'
 
 # --- Constants ---
-SCRIPT_VERSION="1.0"
+SCRIPT_VERSION="1.0-FIX1"
 CONFIG_DIR="/etc/bw-limit"
 BLACKLIST_FILE="${CONFIG_DIR}/blacklist.txt"
 CGROUP_BASE="/sys/fs/cgroup/net_cls"
@@ -405,13 +405,17 @@ add_tc_filter_for_user() {
     # Remove existing filter with same prio (idempotent)
     tc filter del dev "$LO_IFACE" parent "${TC_MAJOR}:" protocol ip prio "$classid_index" 2>/dev/null
     
-    # Add filter: cgroup match classid_hex → flowid tc_classid
-    if ! tc filter add dev "$LO_IFACE" parent "${TC_MAJOR}:" protocol ip prio "$classid_index" cgroup handle "$classid_hex" flowid "${tc_classid}" 2>/dev/null; then
+    # CORRECT SYNTAX (FIX1 v27): handle BEFORE cgroup, NO flowid parameter
+    # Verified via PERINTAH #8c Test 1: tc filter add ... handle HEX cgroup
+    # cgroup classifier auto-routes packets to class matching the handle (classid)
+    # flowid NOT supported (Test 2 GAGAL "What is flowid?")
+    # handle REQUIRED (Test 3 GAGAL "Invalid argument")
+    if ! tc filter add dev "$LO_IFACE" parent "${TC_MAJOR}:" protocol ip prio "$classid_index" handle "$classid_hex" cgroup 2>/dev/null; then
         echo -e "${RED}GAGAL: tc filter add cgroup handle ${classid_hex}${NC}"
         return 1
     fi
     
-    log_msg "tc filter add: cgroup handle ${classid_hex} → flowid ${tc_classid}"
+    log_msg "tc filter add: handle ${classid_hex} cgroup (auto-route to ${tc_classid})"
     return 0
 }
 
