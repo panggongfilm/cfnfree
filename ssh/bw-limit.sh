@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================================
 # Script : bw-limit.sh
-# Version : v1.0-FIX1 (Sesi 2.8-A - v27)
+# Version : v1.1 (Sesi 2.8-B - v28)
 # Brand  : HAXOR TUNNELING
 # Tagline: DEKENG ANE BIAK BELITONG
 # Source : Original HAXOR wrapper - Pattern 36+37+38+39 v26
@@ -48,6 +48,7 @@
 #   bw-limit --remove <user>         Remove user dari blacklist
 #   bw-limit --show                  Show detail tc + cgroup
 #   bw-limit --watch                 Manual trigger assign new PID ke cgroup
+#   bw-limit --init                  Rebuild tc + cgroup dari blacklist.txt (untuk systemd init saat boot)
 #   bw-limit --reset                 Clear ALL (confirmation "YA")
 #   bw-limit --help                  Help text
 #   bw-limit --version               Version info
@@ -69,7 +70,7 @@ BG_CYAN=$'\033[48;5;24m'
 BG_TEAL=$'\033[48;5;30m'
 
 # --- Constants ---
-SCRIPT_VERSION="1.0-FIX1"
+SCRIPT_VERSION="1.1"
 CONFIG_DIR="/etc/bw-limit"
 BLACKLIST_FILE="${CONFIG_DIR}/blacklist.txt"
 CGROUP_BASE="/sys/fs/cgroup/net_cls"
@@ -99,7 +100,7 @@ show_header() {
     echo -e "+-------------------------------------------------------------------+"
     echo -e "${NC}"
     echo -e "${GRAY}cgroup net_cls v1 + tc HTB di lo + Option B Force Reconnect${NC}"
-    echo -e "${GRAY}Pattern 36+37+38+39 v26 | v${SCRIPT_VERSION}${NC}"
+    echo -e "${GRAY}Pattern 36+37+38+39+40 v26-v27 | v${SCRIPT_VERSION}${NC}"
     echo ""
 }
 
@@ -828,6 +829,118 @@ cmd_watch() {
     echo -e "${GRAY}Next: cron watcher (v28) akan auto-watch setiap 2 menit + flock${NC}"
 }
 
+# ============================================================================
+# cmd_init (NEW v28): Rebuild tc + cgroup dari blacklist.txt
+#   - Dipanggil oleh systemd init service saat VPS boot
+#   - Idempotent: aman dijalankan berkali-kali (tc class replace + cgroup reuse)
+#   - Hanya rebuild infrastructure (tc qdisc/class/filter + cgroup dirs)
+#   - TIDAK assign PID ke cgroup (PID belum ada saat boot — cron watcher akan handle)
+# ============================================================================
+cmd_init() {
+    echo -e "${CYAN}=== INIT: Rebuild tc + cgroup dari blacklist.txt ===${NC}"
+    echo ""
+    
+    ensure_config_dir
+    
+    if [ ! -d "$CGROUP_BASE" ]; then
+        echo -e "${RED}ERROR: cgroup net_cls base dir TIDAK ADA di ${CGROUP_BASE}${NC}"
+        echo -e "${GRAY}(cgroup v1 net_cls tidak di-mount — cek kernel config / boot params)${NC}"
+        return 1
+    fi
+    
+    if ! command -v tc >/dev/null; then
+        echo -e "${RED}ERROR: tc binary TIDAK ADA${NC}"
+        return 1
+    fi
+    
+    if [ ! -f "$BLACKLIST_FILE" ] || [ ! -s "$BLACKLIST_FILE" ]; then
+        echo -e "${YELLOW}Blacklist kosong. Hanya setup tc root + default class.${NC}"
+        if ! setup_tc_root; then
+            echo -e "${RED}GAGAL setup tc root${NC}"
+            return 1
+        fi
+        echo -e "${GREEN}TC root setup OK (empty blacklist — siap untuk --add user baru)${NC}"
+        log_msg "init: tc root setup (empty blacklist)"
+        return 0
+    fi
+    
+    # Step 1: Setup tc HTB root (idempotent)
+    echo -e "${GRAY}[1/2] Setup tc HTB root di ${LO_IFACE} (PATTERN 37)...${NC}"
+    if ! setup_tc_root; then
+        echo -e "${RED}GAGAL setup tc root${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}OK${NC}"
+    
+    # Step 2: Rebuild per-user (cgroup + tc class + tc filter)
+    local total_rebuilt=0
+    local total_skip=0
+    local user rate idx
+    
+    echo ""
+    echo -e "${GRAY}[2/2] Rebuild per-user dari blacklist.txt...${NC}"
+    while IFS=: read -r user rate idx; do
+        # Skip empty lines + comments
+        [ -z "$user" ] && continue
+        [[ "$user" =~ ^# ]] && continue
+        
+        # Validate classid_index is integer
+        if ! [[ "$idx" =~ ^[0-9]+$ ]]; then
+            echo -e "${RED}SKIP: user '${user}' punya classid_index INVALID ('${idx}') — format harus user:rate:integer${NC}"
+            total_skip=$((total_skip + 1))
+            continue
+        fi
+        
+        # Validate rate is positive integer
+        if ! [[ "$rate" =~ ^[0-9]+$ ]] || [ "$rate" -lt 1 ] || [ "$rate" -gt 1000 ]; then
+            echo -e "${RED}SKIP: user '${user}' punya rate INVALID ('${rate}') — harus integer 1-1000${NC}"
+            total_skip=$((total_skip + 1))
+            continue
+        fi
+        
+        local classid_hex tc_classid cgroup_name
+        classid_hex=$(get_classid_hex "$idx")
+        tc_classid=$(get_tc_classid "$idx")
+        cgroup_name=$(get_cgroup_name "$user")
+        
+        echo -e "${GRAY}→ Rebuild user '${user}' (rate=${rate} Mbps, class=${tc_classid}, handle=${classid_hex})...${NC}"
+        
+        # Step 2a: Create cgroup (idempotent — reuse if exists, re-set classid)
+        if ! create_cgroup_for_user "$user" "$idx"; then
+            echo -e "${RED}  GAGAL create cgroup untuk '${user}'${NC}"
+            total_skip=$((total_skip + 1))
+            continue
+        fi
+        
+        # Step 2b: Add tc class (idempotent via tc class replace)
+        if ! add_tc_class_for_user "$user" "$rate" "$idx"; then
+            echo -e "${RED}  GAGAL add tc class untuk '${user}'${NC}"
+            total_skip=$((total_skip + 1))
+            continue
+        fi
+        
+        # Step 2c: Add tc filter (idempotent — del existing + add new, PATTERN 40)
+        if ! add_tc_filter_for_user "$user" "$idx"; then
+            echo -e "${RED}  GAGAL add tc filter untuk '${user}'${NC}"
+            total_skip=$((total_skip + 1))
+            continue
+        fi
+        
+        echo -e "${GREEN}  OK: ${user} rebuilt (cgroup ${cgroup_name} + tc class ${tc_classid} + filter handle ${classid_hex})${NC}"
+        log_msg "init: rebuild tc + cgroup untuk user ${user} (idx=${idx}, rate=${rate})"
+        total_rebuilt=$((total_rebuilt + 1))
+    done < "$BLACKLIST_FILE"
+    
+    echo ""
+    echo -e "${CYAN}=== INIT COMPLETE ===${NC}"
+    echo -e "Total rebuilt : ${GREEN}${total_rebuilt}${NC} user"
+    [ "$total_skip" -gt 0 ] && echo -e "Total skip    : ${RED}${total_skip}${NC} user (lihat error di atas)"
+    echo ""
+    echo -e "${GRAY}Infrastructure (tc + cgroup) siap. PID assignment TIDAK dilakukan di init.${NC}"
+    echo -e "${GRAY}Cron watcher (*/2 * * * * + flock) akan auto-assign new PID ke cgroup.${NC}"
+    echo -e "${GRAY}Untuk assign PID sekarang (manual): bw-limit --watch${NC}"
+}
+
 cmd_reset() {
     echo -e "${RED}=== RESET: Clear ALL tc + cgroup + blacklist ===${NC}"
     echo ""
@@ -898,6 +1011,7 @@ ${CYAN}USAGE:${NC}
   bw-limit --remove <user>         Remove user dari blacklist
   bw-limit --show                  Show detail tc + cgroup
   bw-limit --watch                 Manual trigger assign new PID ke cgroup
+  bw-limit --init                  Rebuild tc + cgroup dari blacklist.txt (untuk boot)
   bw-limit --reset                 Clear ALL (confirmation "YA")
   bw-limit --help                  This help
   bw-limit --version               Version info
@@ -915,11 +1029,15 @@ ${CYAN}EXAMPLES:${NC}
   ${GRAY}# Assign new PID ke cgroup setelah user reconnect${NC}
   bw-limit --watch
 
-${CYAN}DESIGN (v26 FINAL):${NC}
+  ${GRAY}# Rebuild tc + cgroup dari blacklist (untuk systemd init saat boot)${NC}
+  bw-limit --init
+
+${CYAN}DESIGN (v26 FINAL + v28 UPDATE):${NC}
   P1=B  Combined limit (download + upload gabung, egress di lo)
   P2=B  Hard cap (rate=ceil, NO burst)
   P3=C  Manual input rate per user (no default)
-  P4=B  Cron 2 menit + flock -n (cron setup defer v28)
+  P4=B  Cron 2 menit + flock -n (LIVE v28: /etc/cron.d/bw-limit)
+  INIT systemd v28: /etc/systemd/system/bw-limit-init.service (Type=oneshot)
 
 ${CYAN}ARCHITECTURE (Pattern 36+37+38+39 v26):${NC}
   ${GRAY}- tc HTB root di lo interface (BUKAN eth0, PATTERN 37)${NC}
@@ -935,6 +1053,8 @@ ${CYAN}LIMITATION (LESSON 48 v26):${NC}
 ${CYAN}FILES:${NC}
   /usr/bin/bw-limit                 Script ini
   /etc/bw-limit/blacklist.txt       Blacklist (user:rate_mbps:classid_index)
+  /etc/cron.d/bw-limit              Cron watcher (*/2 * * * * + flock -n) [v28]
+  /etc/systemd/system/bw-limit-init.service  Init service untuk boot [v28]
   /var/log/bw-limit.log             Event log
 
 ${CYAN}ETHICAL COMMITMENT (v21-v26 RETAINED):${NC}
@@ -960,11 +1080,12 @@ show_menu() {
     printf "  ${YELLOW}03${NC}) Remove User dari Blacklist\n"
     printf "  ${YELLOW}04${NC}) Show Detail (tc + cgroup)\n"
     printf "  ${YELLOW}05${NC}) Watch (assign new PID ke cgroup)\n"
-    printf "  ${YELLOW}06${NC}) Reset (clear ALL)\n"
-    printf "  ${YELLOW}07${NC}) Help\n"
+    printf "  ${YELLOW}06${NC}) Init (rebuild tc + cgroup dari blacklist) [NEW v28]\n"
+    printf "  ${YELLOW}07${NC}) Reset (clear ALL)\n"
+    printf "  ${YELLOW}08${NC}) Help\n"
     printf "  ${YELLOW}0X${NC}) Exit\n"
     echo ""
-    read -p "$(echo -e "${GRAY}Pilih opsi [01-07 / 0X]: ${NC}")" choice
+    read -p "$(echo -e "${GRAY}Pilih opsi [01-08 / 0X]: ${NC}")" choice
 }
 
 handle_choice() {
@@ -1006,10 +1127,15 @@ handle_choice() {
             ;;
         06|6)
             clear
-            cmd_reset
+            cmd_init
             pause
             ;;
         07|7)
+            clear
+            cmd_reset
+            pause
+            ;;
+        08|8)
             clear
             cmd_help
             pause
@@ -1020,7 +1146,7 @@ handle_choice() {
             ;;
         *)
             echo -e "${RED}Opsi tidak dikenal: ${choice}${NC}"
-            echo -e "${GRAY}Pilihan valid: 01-07 atau 0X (exit)${NC}"
+            echo -e "${GRAY}Pilihan valid: 01-08 atau 0X (exit)${NC}"
             sleep 2
             ;;
     esac
@@ -1057,6 +1183,9 @@ main() {
         --watch)
             cmd_watch
             ;;
+        --init)
+            cmd_init
+            ;;
         --reset)
             cmd_reset
             ;;
@@ -1064,7 +1193,7 @@ main() {
             cmd_help
             ;;
         --version|-v)
-            echo "bw-limit v${SCRIPT_VERSION} (Sesi 2.8-A - v27)"
+            echo "bw-limit v${SCRIPT_VERSION} (Sesi 2.8-B - v28)"
             echo "HAXOR TUNNELING - DEKENG ANE BIAK BELITONG"
             ;;
         "")
