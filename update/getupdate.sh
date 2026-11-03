@@ -36,9 +36,11 @@ cd /usr/bin
 # remove file
 rm menu
 rm -rf menu
-# Download update (6 menu files + 7 utility Fase 1+2 HAXOR)
+# Download update (6 menu files + 8 utility Fase 1+2 HAXOR)
 # Note: bw-user butuh 'sudo bw-user --setup' setelah install (cron + dirs)
 # Note: pantau + tendang-safe siap pakai (no setup needed)
+# Note: bw-limit butuh 'sudo bw-limit --init' setelah install (rebuild tc + cgroup dari blacklist)
+#       + setup cron watcher + systemd init service (lihat README v28)
 wget -O menu "https://${lizupdate}/menu.sh"
 wget -O maddssh "https://${lizupdate}/maddssh.sh"
 wget -O mbackup "https://${lizupdate}/mbackup.sh"
@@ -51,9 +53,10 @@ wget -O speedtest-haxor "https://${lizssh}/speedtest-haxor.sh"
 wget -O clearlog "https://${lizssh}/clearlog.sh"
 wget -O clearcache "https://${lizssh}/clearcache.sh"
 wget -O bw-user "https://${lizssh}/bw-user.sh"
-# Download utility Fase 2 (monitoring + tendang aman HAXOR)
+# Download utility Fase 2 (monitoring + tendang aman + bw-limit HAXOR)
 wget -O pantau "https://${lizssh}/pantau.sh"
 wget -O tendang-safe "https://${lizssh}/tendang-safe.sh"
+wget -O bw-limit "https://${lizssh}/bw-limit.sh"
 # change Permission
 chmod +x menu
 chmod +x maddssh
@@ -68,6 +71,7 @@ chmod +x clearcache
 chmod +x bw-user
 chmod +x pantau
 chmod +x tendang-safe
+chmod +x bw-limit
 #change direct
 cd /root
 # clear
