@@ -1,60 +1,45 @@
 #!/bin/bash
-# ============================================================================
-# Script : bw-limit.sh
-# Version : v1.1 (Sesi 2.8-B - v28)
-# Brand  : HAXOR TUNNELING
-# Tagline: DEKENG ANE BIAK BELITONG
-# Source : Original HAXOR wrapper - Pattern 36+37+38+39 v26
-# ============================================================================
-# Fungsi:
-#   - Limit speed per user (blacklist manual by admin)
-#   - cgroup net_cls v1 + tc HTB di lo interface (PATTERN 36+37 v26)
-#   - Option B Force Reconnect (kill existing PID, reconnect 30 detik) (PATTERN 38 v26)
-#   - Blacklist persistence file /etc/bw-limit/blacklist.txt
-#
-# Design FINAL v26:
-#   P1=B (Combined limit, egress di lo) - DOWNLOAD + UPLOAD gabung
-#   P2=B (Hard cap, rate=ceil, NO burst)
-#   P3=C (manual input rate per user, no default)
-#   P4=B (cron 2 menit + flock -n) - cron setup defer v28
-#
-# LESSON 48 v26: cgroup net_cls v1 set sk_classid di SOCKET CREATION TIME
-#   Existing socket TIDAK update classid saat PID di-move ke cgroup
-#   Solution: kill -TERM existing PID (Option B Force Reconnect) → reconnect
-#   → new socket dibuat dengan sk_classid benar → shape apply
-#
-# LESSON 49 v26: classid format 0xAAAABBBB = tc class AAAA:BBBB
-#   Convention v27+: user ke-N → classid 0x10000N = tc class 16:N
-#   High 16-bit = 0x0010 = 16 (major), low 16-bit = N (minor)
-#
-# LESSON 50 v26: tc di interface lo (loopback) untuk shape Dropbear child
-#   Packet Dropbear child peer 127.0.0.1 egress via lo (BUKAN eth0)
-#
-# LESSON 51 v26: cgroup net_cls assignment WORK untuk Dropbear child
-#   (meskipun UID=root, cgroup based on PID BUKAN UID)
-#
-# LESSON 52 v26: IFB module tidak diperlukan untuk SSH tunneling proxy case
-#
-# Komitmen etis v21+v22+v23+v24+v25+v26 RETAINED:
-#   - NO tendang/throttle SEMUA user (global cap)
-#   - Throttle BOLEH untuk user blacklist (manual by admin, BUKAN auto-kick)
-#   - Option B Force Reconnect = brief disconnect 30 detik untuk user blacklist
-#     (BUKAN tendang semua user, hanya user yang di-blacklist)
-#
-# CLI Commands:
-#   bw-limit                         Interactive menu (Pattern 1+3)
-#   bw-limit --list                  List blacklist + status
-#   bw-limit --add <user> <mbps>     Add user ke blacklist + force reconnect
-#   bw-limit --remove <user>         Remove user dari blacklist
-#   bw-limit --show                  Show detail tc + cgroup
-#   bw-limit --watch                 Manual trigger assign new PID ke cgroup
-#   bw-limit --init                  Rebuild tc + cgroup dari blacklist.txt (untuk systemd init saat boot)
-#   bw-limit --reset                 Clear ALL (confirmation "YA")
-#   bw-limit --help                  Help text
-#   bw-limit --version               Version info
-# ============================================================================
+# ============================================================
+# Script  : bw-limit.sh
+# Version : v2.0 (Sesi 2.9-A - v32) — IPTABLES MARK per-UID + tc HTB
+# Path    : /ssh/bw-limit.sh
+# Brand   : HAXOR TUNNELING
+# Tagline : DEKENG ANE BIAK BELITONG
+# Source  : Original HAXOR wrapper - v2.0 rewrite (replace v1.1 cgroup approach)
+# ============================================================
+# DESIGN v2.0 (PATH X SUCCESS foundation, Dropbear 2026.94):
+#   - iptables -t mangle OUTPUT -m owner --uid-owner <UID> -j MARK --set-mark <idx>
+#   - tc HTB root di eth0 (shape upload) + tc HTB root di lo (shape download)
+#   - tc fw classifier: handle <idx> fw flowid <MAJOR>:<idx>
+#   - Blacklist manual by admin (P3=C v26 retained)
+#   - Hard cap (P2=B v26 retained): rate=ceil, no burst
+#   - NO cgroup (chicken-and-egg v29 SOLVED by iptables real-time mark)
+#   - NO cron watcher (iptables rules persistent, mark works on existing socket)
+#   - NO Force Reconnect (mark works on existing socket real-time, unlike cgroup sk_classid)
+# ============================================================
+# KOMITMEN ETIS USER v21+v24 (WAJIB dipertahankan):
+#   - Throttle HANYA untuk user blacklist manual by admin
+#   - BUKAN auto-kick, BUKAN throttle semua user
+#   - User normal tetap full speed (default class 1Gbit)
+# ============================================================
 
-# --- Palette 256-color ANSI-C quoting $'...' (Pattern 5 + LESSON v6 FIX1) ---
+# ============================================================
+# CONSTANTS
+# ============================================================
+SCRIPT_VERSION="2.0"
+CONFIG_DIR="/etc/bw-limit"
+BLACKLIST_FILE="${CONFIG_DIR}/blacklist.txt"
+IPTABLES_SAVE_FILE="${CONFIG_DIR}/iptables-rules.save"
+LOG_FILE="/var/log/bw-limit.log"
+TC_ETH0_MAJOR=1
+TC_LO_MAJOR=2
+TC_DEFAULT_CLASS_MINOR=9999
+ETH0_IFACE="eth0"
+LO_IFACE="lo"
+
+# ============================================================
+# PALETTE 256-COLOR (ANSI-C quoting $'...' — Pattern 5 + LESSON v6 FIX1)
+# ============================================================
 CYAN=$'\033[38;5;51m'
 TEAL=$'\033[38;5;80m'
 GREEN=$'\033[38;5;46m'
@@ -69,1028 +54,611 @@ NC=$'\033[0m'
 BG_CYAN=$'\033[48;5;24m'
 BG_TEAL=$'\033[48;5;30m'
 
-# --- Constants ---
-SCRIPT_VERSION="1.1"
-CONFIG_DIR="/etc/bw-limit"
-BLACKLIST_FILE="${CONFIG_DIR}/blacklist.txt"
-CGROUP_BASE="/sys/fs/cgroup/net_cls"
-CGROUP_PREFIX="haxor_"
-TC_MAJOR=16
-TC_DEFAULT_CLASS_MINOR=9999
-TC_DEFAULT_RATE="1000mbit"
-LO_IFACE="lo"
-LOG_FILE="/var/log/bw-limit.log"
-# System daemon filter (NO root - admin boleh blacklist root kalau mau)
-SYSTEM_USERS_FILTER="sslh daemon nobody systemd sshd www-data message syslog usbmux dnsmasq bin mail news proxy irc list gnats nobody4 udpdns ntpd messagebus"
-
-# --- Global caches (Pattern 24 v14) ---
-JOURNAL_LOG_CACHE=""
-AUTH_LOG_CACHE=""
-
-# ============================================================================
-# Helper Functions
-# ============================================================================
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
 
 show_header() {
-    clear
-    echo -e "${BG_CYAN}${WHITE}"
-    echo -e "+-------------------------------------------------------------------+"
-    echo -e "|  BANDWIDTH LIMIT PER-USER - HAXOR TUNNELING                       |"
-    echo -e "|  DEKENG ANE BIAK BELITONG                                          |"
-    echo -e "+-------------------------------------------------------------------+"
-    echo -e "${NC}"
-    echo -e "${GRAY}cgroup net_cls v1 + tc HTB di lo + Option B Force Reconnect${NC}"
-    echo -e "${GRAY}Pattern 36+37+38+39+40 v26-v27 | v${SCRIPT_VERSION}${NC}"
-    echo ""
+    echo -e "${BG_CYAN}${WHITE}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BG_CYAN}${WHITE}║          BANDWIDTH LIMIT v2.0 - HAXOR TUNNELING              ║${NC}"
+    echo -e "${BG_CYAN}${WHITE}║              DEKENG ANE BIAK BELITONG                        ║${NC}"
+    echo -e "${BG_TEAL}${WHITE}║  iptables MARK per-UID + tc HTB (eth0+lo) — no cgroup       ║${NC}"
+    echo -e "${BG_TEAL}${WHITE}╚══════════════════════════════════════════════════════════════╝${NC}"
 }
 
 pause() {
-    echo ""
+    [ -t 0 ] || return 0
+    echo
     echo -e "${GRAY}Tekan enter untuk kembali ke menu...${NC}"
-    read -r dummy
+    read -r _
 }
 
 log_msg() {
     local msg="$1"
-    local ts
-    ts=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[${ts}] ${msg}" >> "$LOG_FILE" 2>/dev/null
-}
-
-# Pattern 24 v14 - Global cache untuk journalctl/auth.log (fetched 1x per script run)
-fetch_journal_log() {
-    if [ -z "$JOURNAL_LOG_CACHE" ]; then
-        JOURNAL_LOG_CACHE=$(timeout 10 journalctl --since "24 hours ago" --no-pager 2>/dev/null | grep -E "dropbear|sshd" || true)
-    fi
-    echo "$JOURNAL_LOG_CACHE"
-}
-
-fetch_auth_log() {
-    if [ -z "$AUTH_LOG_CACHE" ]; then
-        if [ -r /var/log/auth.log ]; then
-            AUTH_LOG_CACHE=$(grep -E "dropbear|sshd" /var/log/auth.log 2>/dev/null || true)
-        fi
-    fi
-    echo "$AUTH_LOG_CACHE"
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [bw-limit v${SCRIPT_VERSION}] ${msg}" >> "$LOG_FILE"
 }
 
 is_valid_user() {
     local user="$1"
     [ -z "$user" ] && return 1
-    getent passwd "$user" >/dev/null 2>&1
+    id "$user" >/dev/null 2>&1
 }
 
+get_uid_for_user() {
+    local user="$1"
+    id -u "$user" 2>/dev/null
+}
+
+# System users to skip (NOT tunneling users — Pattern 26 v14 adapted)
 is_system_user() {
     local user="$1"
-    [ -z "$user" ] && return 0
-    for sys_user in $SYSTEM_USERS_FILTER; do
-        if [ "$user" = "$sys_user" ]; then
-            return 0
-        fi
-    done
-    return 1
+    case "$user" in
+        root|sslh|daemon|nobody|systemd+|sshd|www-data|message+|syslog|usbmux|dnsmasq|vps|sync|mail|news|proxy|irc|gnats|systemd-network|systemd-resolve|dbus|_apt|postfix|statd)
+            return 0 ;;
+        *)
+            return 1 ;;
+    esac
 }
 
-# Pattern 19 v13 - auth.log PID matching untuk resolve Dropbear child PID per user
-# Returns: space-separated list of alive Dropbear PIDs for user
-resolve_dropbear_pids_for_user() {
-    local user="$1"
-    local pids=""
-    local log_line pid
-    
-    # Cari di journalctl cache dulu (Pattern 24)
-    local journal_cache
-    journal_cache=$(fetch_journal_log)
-    
-    while IFS= read -r log_line; do
-        [ -z "$log_line" ] && continue
-        # Pattern: "dropbear[PID]: Password auth succeeded for 'USER' from IP:PORT"
-        if [[ "$log_line" =~ dropbear\[([0-9]+)\]:\ Password\ auth\ succeeded\ for\ \'${user}\' ]]; then
-            pid="${BASH_REMATCH[1]}"
-            # Verify PID still alive + is Dropbear child
-            if [ -d "/proc/${pid}" ]; then
-                local args
-                args=$(ps -p "$pid" -o args= 2>/dev/null)
-                if [[ "$args" == *dropbear* ]]; then
-                    pids="${pids}${pid} "
-                fi
-            fi
-        fi
-    done <<< "$journal_cache"
-    
-    # Fallback ke auth.log cache kalau journalctl kosong
-    if [ -z "$pids" ]; then
-        local auth_cache
-        auth_cache=$(fetch_auth_log)
-        while IFS= read -r log_line; do
-            [ -z "$log_line" ] && continue
-            if [[ "$log_line" =~ dropbear\[([0-9]+)\]:\ Password\ auth\ succeeded\ for\ \'${user}\' ]]; then
-                pid="${BASH_REMATCH[1]}"
-                if [ -d "/proc/${pid}" ]; then
-                    local args
-                    args=$(ps -p "$pid" -o args= 2>/dev/null)
-                    if [[ "$args" == *dropbear* ]]; then
-                        pids="${pids}${pid} "
-                    fi
-                fi
-            fi
-        done <<< "$auth_cache"
-    fi
-    
-    # Dedup + trim
-    pids=$(echo "$pids" | tr ' ' '\n' | sort -u | grep -v '^$' | tr '\n' ' ' | sed 's/ *$//')
-    echo "$pids"
-}
-
-get_cgroup_name() {
-    local user="$1"
-    echo "${CGROUP_BASE}/${CGROUP_PREFIX}${user}"
-}
-
-# PATTERN 36 v26 - classid format 0xAAAABBBB = tc class AAAA:BBBB
-# Convention: user ke-N → classid 0x10000N = tc class 16:N
-# High 16-bit = 0x0010 = 16 (major), low 16-bit = N (minor, hex)
-get_classid_hex() {
-    local index="$1"
-    printf "0x10%04x" "$index"
-}
-
-get_tc_classid() {
-    local index="$1"
-    printf "%d:%d" "$TC_MAJOR" "$index"
-}
-
-get_next_classid_index() {
-    if [ ! -f "$BLACKLIST_FILE" ]; then
-        echo 1
-        return
-    fi
-    local max_idx=0 idx
-    while IFS=: read -r _ _ idx; do
-        [ -z "$idx" ] && continue
-        if [ "$idx" -gt "$max_idx" ] 2>/dev/null; then
-            max_idx=$idx
-        fi
-    done < "$BLACKLIST_FILE"
-    echo $((max_idx + 1))
-}
-
-# ============================================================================
-# TC Setup Functions (PATTERN 37 v26 - tc HTB root di lo interface)
-# ============================================================================
-
-# Idempotent: setup HTB root di lo if not already
-setup_tc_root() {
-    local current_qdisc
-    current_qdisc=$(tc qdisc show dev "$LO_IFACE" 2>/dev/null | head -1)
-    
-    if [[ "$current_qdisc" == *"htb ${TC_MAJOR}:"* ]]; then
-        return 0  # Already setup
-    fi
-    
-    # Replace current qdisc dengan HTB root
-    if ! tc qdisc replace dev "$LO_IFACE" root handle "${TC_MAJOR}:" htb 2>/dev/null; then
-        echo -e "${RED}GAGAL: tc qdisc replace dev ${LO_IFACE} root handle ${TC_MAJOR}: htb${NC}"
-        return 1
-    fi
-    
-    # Add default class (1000mbit unlimited) - untuk traffic yang tidak di-mark
-    if ! tc class replace dev "$LO_IFACE" parent "${TC_MAJOR}:" classid "${TC_MAJOR}:${TC_DEFAULT_CLASS_MINOR}" htb rate "${TC_DEFAULT_RATE}" ceil "${TC_DEFAULT_RATE}" 2>/dev/null; then
-        echo -e "${RED}GAGAL: tc class add default${NC}"
-        return 1
-    fi
-    
-    log_msg "TC root setup: qdisc HTB ${TC_MAJOR}: + default class ${TC_MAJOR}:${TC_DEFAULT_CLASS_MINOR} (${TC_DEFAULT_RATE})"
-    return 0
-}
-
-teardown_tc_root() {
-    local current_qdisc
-    current_qdisc=$(tc qdisc show dev "$LO_IFACE" 2>/dev/null | head -1)
-    
-    if [[ "$current_qdisc" != *"htb ${TC_MAJOR}:"* ]]; then
-        return 0  # Not setup, nothing to teardown
-    fi
-    
-    tc qdisc del dev "$LO_IFACE" root 2>/dev/null
-    log_msg "TC root teardown: qdisc HTB ${TC_MAJOR}: removed, lo back to noqueue"
-}
-
-# ============================================================================
-# cgroup Functions (PATTERN 36 v26 + LESSON 51 v26)
-# ============================================================================
-
-create_cgroup_for_user() {
-    local user="$1"
-    local classid_index="$2"
-    local cgroup_name
-    cgroup_name=$(get_cgroup_name "$user")
-    local classid_hex
-    classid_hex=$(get_classid_hex "$classid_index")
-    
-    if [ -d "$cgroup_name" ]; then
-        echo -e "${YELLOW}NOTE: cgroup ${cgroup_name} sudah ada, akan reuse${NC}"
-    else
-        if ! mkdir "$cgroup_name" 2>/dev/null; then
-            echo -e "${RED}GAGAL: mkdir ${cgroup_name}${NC}"
-            return 1
-        fi
-    fi
-    
-    if ! echo "$classid_hex" > "${cgroup_name}/net_cls.classid" 2>/dev/null; then
-        echo -e "${RED}GAGAL: set classid ${classid_hex}${NC}"
-        rmdir "$cgroup_name" 2>/dev/null
-        return 1
-    fi
-    
-    log_msg "cgroup create: ${cgroup_name} classid=${classid_hex}"
-    return 0
-}
-
-# PATTERN 39 v26 - cleanup fallback: move PID ke root cgroup sebelum rmdir
-remove_cgroup_for_user() {
-    local user="$1"
-    local cgroup_name
-    cgroup_name=$(get_cgroup_name "$user")
-    
-    if [ ! -d "$cgroup_name" ]; then
-        return 0  # Not exists, nothing to remove
-    fi
-    
-    # Move all PIDs ke root cgroup (PATTERN 39)
-    local pid
-    while IFS= read -r pid; do
-        [ -z "$pid" ] && continue
-        echo "$pid" > "${CGROUP_BASE}/tasks" 2>/dev/null
-    done < "${cgroup_name}/tasks" 2>/dev/null
-    
-    # Now safe to rmdir
-    if ! rmdir "$cgroup_name" 2>/dev/null; then
-        echo -e "${YELLOW}WARNING: rmdir ${cgroup_name} GAGAL, mungkin masih ada PID${NC}"
-        return 1
-    fi
-    
-    log_msg "cgroup remove: ${cgroup_name}"
-    return 0
-}
-
-assign_pid_to_cgroup() {
-    local pid="$1"
-    local user="$2"
-    local cgroup_name
-    cgroup_name=$(get_cgroup_name "$user")
-    
-    if [ ! -d "$cgroup_name" ]; then
-        return 1
-    fi
-    
-    if ! echo "$pid" > "${cgroup_name}/tasks" 2>/dev/null; then
-        return 1
-    fi
-    
-    return 0
-}
-
-is_pid_in_cgroup() {
-    local pid="$1"
-    local user="$2"
-    local cgroup_name
-    cgroup_name=$(get_cgroup_name "$user")
-    
-    if [ ! -d "$cgroup_name" ]; then
-        return 1
-    fi
-    
-    grep -q "^${pid}$" "${cgroup_name}/tasks" 2>/dev/null
-}
-
-# ============================================================================
-# TC Class + Filter Functions (PATTERN 36 v26 - Hard cap P2=B)
-# ============================================================================
-
-add_tc_class_for_user() {
-    local user="$1"
-    local rate_mbps="$2"
-    local classid_index="$3"
-    local tc_classid
-    tc_classid=$(get_tc_classid "$classid_index")
-    local rate_str="${rate_mbps}mbit"
-    
-    # P2=B Hard cap: rate = ceil, NO burst
-    if ! tc class replace dev "$LO_IFACE" parent "${TC_MAJOR}:" classid "${tc_classid}" htb rate "${rate_str}" ceil "${rate_str}" 2>/dev/null; then
-        echo -e "${RED}GAGAL: tc class add ${tc_classid} rate=${rate_str}${NC}"
-        return 1
-    fi
-    
-    log_msg "tc class add: ${tc_classid} rate=${rate_str} ceil=${rate_str} (Hard cap P2=B)"
-    return 0
-}
-
-remove_tc_class_for_user() {
-    local classid_index="$1"
-    local tc_classid
-    tc_classid=$(get_tc_classid "$classid_index")
-    
-    tc class del dev "$LO_IFACE" classid "${tc_classid}" 2>/dev/null
-    log_msg "tc class del: ${tc_classid}"
-}
-
-add_tc_filter_for_user() {
-    local user="$1"
-    local classid_index="$2"
-    local classid_hex
-    classid_hex=$(get_classid_hex "$classid_index")
-    local tc_classid
-    tc_classid=$(get_tc_classid "$classid_index")
-    
-    # Remove existing filter with same prio (idempotent)
-    tc filter del dev "$LO_IFACE" parent "${TC_MAJOR}:" protocol ip prio "$classid_index" 2>/dev/null
-    
-    # CORRECT SYNTAX (FIX1 v27): handle BEFORE cgroup, NO flowid parameter
-    # Verified via PERINTAH #8c Test 1: tc filter add ... handle HEX cgroup
-    # cgroup classifier auto-routes packets to class matching the handle (classid)
-    # flowid NOT supported (Test 2 GAGAL "What is flowid?")
-    # handle REQUIRED (Test 3 GAGAL "Invalid argument")
-    if ! tc filter add dev "$LO_IFACE" parent "${TC_MAJOR}:" protocol ip prio "$classid_index" handle "$classid_hex" cgroup 2>/dev/null; then
-        echo -e "${RED}GAGAL: tc filter add cgroup handle ${classid_hex}${NC}"
-        return 1
-    fi
-    
-    log_msg "tc filter add: handle ${classid_hex} cgroup (auto-route to ${tc_classid})"
-    return 0
-}
-
-remove_tc_filter_for_user() {
-    local classid_index="$1"
-    tc filter del dev "$LO_IFACE" parent "${TC_MAJOR}:" protocol ip prio "$classid_index" 2>/dev/null
-    log_msg "tc filter del: prio ${classid_index}"
-}
-
-# ============================================================================
-# Blacklist File Functions
-# ============================================================================
+# ============================================================
+# BLACKLIST MANAGEMENT
+# File: /etc/bw-limit/blacklist.txt
+# Format: user:rate_mbps:classid_index (one per line)
+# ============================================================
 
 ensure_config_dir() {
-    if [ ! -d "$CONFIG_DIR" ]; then
-        mkdir -p "$CONFIG_DIR"
-        chmod 755 "$CONFIG_DIR"
-    fi
-    if [ ! -f "$BLACKLIST_FILE" ]; then
-        touch "$BLACKLIST_FILE"
-        chmod 644 "$BLACKLIST_FILE"
-    fi
+    [ -d "$CONFIG_DIR" ] || mkdir -p "$CONFIG_DIR"
+    [ -f "$BLACKLIST_FILE" ] || touch "$BLACKLIST_FILE"
 }
 
 is_user_in_blacklist() {
     local user="$1"
-    [ ! -f "$BLACKLIST_FILE" ] && return 1
-    awk -F: -v u="$user" '$1 == u {found=1} END {exit !found}' "$BLACKLIST_FILE"
+    [ -f "$BLACKLIST_FILE" ] || return 1
+    grep -q "^${user}:" "$BLACKLIST_FILE"
 }
 
 get_user_blacklist_entry() {
     local user="$1"
-    [ ! -f "$BLACKLIST_FILE" ] && return 1
-    grep "^${user}:" "$BLACKLIST_FILE" 2>/dev/null | head -1
+    [ -f "$BLACKLIST_FILE" ] || return 1
+    grep "^${user}:" "$BLACKLIST_FILE" | head -1
+}
+
+get_next_classid_index() {
+    [ -f "$BLACKLIST_FILE" ] || { echo 1; return; }
+    local max=0 idx
+    while IFS=: read -r _ _ idx; do
+        [ -n "$idx" ] && [ "$idx" -gt "$max" ] 2>/dev/null && max=$idx
+    done < "$BLACKLIST_FILE"
+    echo $((max + 1))
 }
 
 add_user_to_blacklist() {
-    local user="$1"
-    local rate_mbps="$2"
-    local classid_index="$3"
+    local user="$1" rate="$2" idx="$3"
     ensure_config_dir
-    echo "${user}:${rate_mbps}:${classid_index}" >> "$BLACKLIST_FILE"
-    log_msg "blacklist add: ${user}:${rate_mbps}:${classid_index}"
+    echo "${user}:${rate}:${idx}" >> "$BLACKLIST_FILE"
 }
 
 remove_user_from_blacklist() {
     local user="$1"
-    local tmp_file
-    tmp_file=$(mktemp)
-    if [ -f "$BLACKLIST_FILE" ]; then
-        grep -v "^${user}:" "$BLACKLIST_FILE" > "$tmp_file" 2>/dev/null
-        mv "$tmp_file" "$BLACKLIST_FILE"
-    fi
-    log_msg "blacklist remove: ${user}"
+    [ -f "$BLACKLIST_FILE" ] || return 0
+    local tmp="${BLACKLIST_FILE}.tmp.$$"
+    grep -v "^${user}:" "$BLACKLIST_FILE" > "$tmp" 2>/dev/null
+    mv "$tmp" "$BLACKLIST_FILE"
 }
 
-# ============================================================================
-# CLI Commands
-# ============================================================================
+# ============================================================
+# TC SETUP (eth0 + lo, idempotent — Pattern 41 v28 adapted)
+# ============================================================
 
-cmd_add() {
-    local user="$1"
-    local rate_mbps="$2"
-    
-    # Validate args
-    if [ -z "$user" ] || [ -z "$rate_mbps" ]; then
-        echo -e "${RED}Usage: bw-limit --add <user> <rate_mbps>${NC}"
-        echo -e "${GRAY}Example: bw-limit --add anti 5${NC}"
-        return 1
-    fi
-    
-    # Validate user exists
-    if ! is_valid_user "$user"; then
-        echo -e "${RED}ERROR: user '${user}' TIDAK ADA di system (getent passwd fail)${NC}"
-        return 1
-    fi
-    
-    # Warn if system user (still allow, just warn)
-    if is_system_user "$user"; then
-        echo -e "${YELLOW}WARNING: '${user}' terdeteksi sebagai system daemon${NC}"
-        read -p "$(echo -e "${YELLOW}Lanjut? (y/n): ${NC}")" confirm
-        [[ ! "$confirm" =~ ^[Yy]$ ]] && return 1
-    fi
-    
-    # Validate rate_mbps (positive integer 1-1000)
-    if ! [[ "$rate_mbps" =~ ^[0-9]+$ ]] || [ "$rate_mbps" -lt 1 ] || [ "$rate_mbps" -gt 1000 ]; then
-        echo -e "${RED}ERROR: rate_mbps harus integer 1-1000${NC}"
-        return 1
-    fi
-    
-    # Check if already in blacklist
-    if is_user_in_blacklist "$user"; then
-        echo -e "${YELLOW}ERROR: user '${user}' SUDAH di blacklist${NC}"
-        echo -e "${GRAY}Gunakan --remove dulu kalau mau ganti rate${NC}"
-        return 1
-    fi
-    
-    # Check prasyarat tc + cgroup
-    if [ ! -d "$CGROUP_BASE" ]; then
-        echo -e "${RED}ERROR: cgroup net_cls dir TIDAK ADA di ${CGROUP_BASE}${NC}"
-        return 1
-    fi
-    if ! command -v tc >/dev/null; then
-        echo -e "${RED}ERROR: tc binary TIDAK ADA${NC}"
-        return 1
-    fi
-    
-    # Allocate classid_index
-    local classid_index
-    classid_index=$(get_next_classid_index)
-    local classid_hex
-    classid_hex=$(get_classid_hex "$classid_index")
-    local tc_classid
-    tc_classid=$(get_tc_classid "$classid_index")
-    
-    echo -e "${CYAN}=== ADD USER KE BLACKLIST ===${NC}"
-    echo -e "User           : ${YELLOW}${user}${NC}"
-    echo -e "Rate (Hard cap): ${YELLOW}${rate_mbps} Mbps${NC} (rate=ceil, NO burst - P2=B)"
-    echo -e "Classid index  : ${YELLOW}${classid_index}${NC}"
-    echo -e "Classid (hex)  : ${YELLOW}${classid_hex}${NC}"
-    echo -e "TC class       : ${YELLOW}${tc_classid}${NC}"
-    echo -e "Cgroup dir     : ${YELLOW}$(get_cgroup_name "$user")${NC}"
-    echo ""
-    
-    # Step 1: Setup tc HTB root di lo (idempotent - PATTERN 37)
-    echo -e "${GRAY}[1/5] Setup tc HTB root di ${LO_IFACE} (PATTERN 37)...${NC}"
-    if ! setup_tc_root; then
-        echo -e "${RED}GAGAL setup tc root${NC}"
-        return 1
-    fi
-    echo -e "${GREEN}OK${NC}"
-    
-    # Step 2: Create cgroup (LESSON 51 - PID-based, BUKAN UID-based)
-    echo -e "${GRAY}[2/5] Create cgroup $(get_cgroup_name "$user") (LESSON 51)...${NC}"
-    if ! create_cgroup_for_user "$user" "$classid_index"; then
-        echo -e "${RED}GAGAL create cgroup${NC}"
-        return 1
-    fi
-    echo -e "${GREEN}OK${NC}"
-    
-    # Step 3: Add tc class (Hard cap P2=B)
-    echo -e "${GRAY}[3/5] Add tc class ${tc_classid} rate=${rate_mbps}mbit (Hard cap P2=B)...${NC}"
-    if ! add_tc_class_for_user "$user" "$rate_mbps" "$classid_index"; then
-        echo -e "${RED}GAGAL add tc class${NC}"
-        remove_cgroup_for_user "$user"
-        return 1
-    fi
-    echo -e "${GREEN}OK${NC}"
-    
-    # Step 4: Add tc filter (PATTERN 36)
-    echo -e "${GRAY}[4/5] Add tc filter cgroup handle ${classid_hex} (PATTERN 36)...${NC}"
-    if ! add_tc_filter_for_user "$user" "$classid_index"; then
-        echo -e "${RED}GAGAL add tc filter${NC}"
-        remove_tc_class_for_user "$classid_index"
-        remove_cgroup_for_user "$user"
-        return 1
-    fi
-    echo -e "${GREEN}OK${NC}"
-    
-    # Step 5: Add to blacklist file
-    echo -e "${GRAY}[5/5] Update blacklist file ${BLACKLIST_FILE}...${NC}"
-    add_user_to_blacklist "$user" "$rate_mbps" "$classid_index"
-    echo -e "${GREEN}OK${NC}"
-    
-    echo ""
-    echo -e "${CYAN}=== SETUP COMPLETE ===${NC}"
-    echo ""
-    
-    # Resolve existing Dropbear PID for user (Pattern 19)
-    local existing_pids
-    existing_pids=$(resolve_dropbear_pids_for_user "$user")
-    
-    if [ -z "$existing_pids" ]; then
-        echo -e "${YELLOW}NOTE: Tidak ada Dropbear PID aktif untuk user '${user}'${NC}"
-        echo -e "${GRAY}User mungkin sedang offline. Saat user connect, jalankan:${NC}"
-        echo -e "${WHITE}  bw-limit --watch${NC}"
-        echo -e "${GRAY}untuk assign new PID ke cgroup.${NC}"
-    else
-        echo -e "${CYAN}Dropbear PID(s) untuk user '${user}': ${YELLOW}${existing_pids}${NC}"
-        echo ""
-        echo -e "${YELLOW}=== OPTION B FORCE RECONNECT (PATTERN 38 v26) ===${NC}"
-        echo -e "${GRAY}LESSON 48 v26: cgroup net_cls v1 set sk_classid di SOCKET CREATION TIME${NC}"
-        echo -e "${GRAY}Existing socket TIDAK update classid saat PID di-move ke cgroup${NC}"
-        echo -e "${GRAY}Solution: kill -TERM existing PID → user reconnect 30 detik →${NC}"
-        echo -e "${GRAY}new socket dibuat dengan sk_classid benar → shape apply${NC}"
-        echo ""
-        echo -e "${RED}User '${user}' akan diskonek sebentar (~30 detik) saat di-kill${NC}"
-        read -p "$(echo -e "${YELLOW}Lanjut kill -TERM? (y/n): ${NC}")" confirm
-        
-        if [[ "$confirm" =~ ^[Yy]$ ]]; then
-            local pid
-            for pid in $existing_pids; do
-                echo -e "${GRAY}Kill -TERM PID ${pid}...${NC}"
-                if kill -TERM "$pid" 2>/dev/null; then
-                    echo -e "${GREEN}OK${NC}"
-                    log_msg "kill -TERM PID ${pid} for user ${user} (Option B Force Reconnect)"
-                else
-                    echo -e "${RED}GAGAL kill PID ${pid}${NC}"
-                fi
-            done
-            echo ""
-            echo -e "${CYAN}User '${user}' diskonek. Tunggu 30 detik untuk reconnect.${NC}"
-            echo -e "${GRAY}Setelah reconnect, jalankan:${NC}"
-            echo -e "${WHITE}  bw-limit --watch${NC}"
-            echo -e "${GRAY}untuk assign new PID ke cgroup.${NC}"
-            echo ""
-            read -p "$(echo -e "${YELLOW}Tunggu 30 detik lalu auto-watch? (y/n): ${NC}")" auto_watch
-            if [[ "$auto_watch" =~ ^[Yy]$ ]]; then
-                echo -e "${GRAY}Menunggu 30 detik untuk user reconnect...${NC}"
-                sleep 30
-                echo ""
-                cmd_watch
-            fi
-        else
-            echo -e "${YELLOW}Kill dibatalkan. Existing PID tidak di-shape.${NC}"
-            echo -e "${GRAY}Untuk apply shape, user harus disconnect + reconnect natural${NC}"
-            echo -e "${GRAY}atau jalankan 'bw-limit --watch' manual setelah user reconnect.${NC}"
-        fi
-    fi
-    
+setup_tc_root() {
+    # eth0: HTB root, default class 9999 (1Gbit unlimited)
+    tc qdisc replace dev "$ETH0_IFACE" root handle ${TC_ETH0_MAJOR}: htb default ${TC_DEFAULT_CLASS_MINOR} 2>/dev/null || return 1
+    tc class replace dev "$ETH0_IFACE" parent root classid ${TC_ETH0_MAJOR}:${TC_DEFAULT_CLASS_MINOR} htb rate 1000mbit ceil 1000mbit 2>/dev/null || return 1
+
+    # lo: HTB root, default class 9999 (1Gbit unlimited)
+    tc qdisc replace dev "$LO_IFACE" root handle ${TC_LO_MAJOR}: htb default ${TC_DEFAULT_CLASS_MINOR} 2>/dev/null || return 1
+    tc class replace dev "$LO_IFACE" parent root classid ${TC_LO_MAJOR}:${TC_DEFAULT_CLASS_MINOR} htb rate 1000mbit ceil 1000mbit 2>/dev/null || return 1
     return 0
 }
+
+teardown_tc_root() {
+    tc qdisc del dev "$ETH0_IFACE" root 2>/dev/null
+    tc qdisc del dev "$LO_IFACE" root 2>/dev/null
+    # Restore default qdisc (eth0 = fq like original kernel default; lo = noqueue auto)
+    tc qdisc replace dev "$ETH0_IFACE" root fq 2>/dev/null
+}
+
+add_tc_class_for_user() {
+    local user="$1" rate="$2" idx="$3"
+    # eth0 class + fw filter
+    tc class replace dev "$ETH0_IFACE" parent ${TC_ETH0_MAJOR}: classid ${TC_ETH0_MAJOR}:${idx} htb rate ${rate}mbit ceil ${rate}mbit 2>/dev/null || return 1
+    tc filter replace dev "$ETH0_IFACE" parent ${TC_ETH0_MAJOR}: protocol ip prio 1 handle ${idx} fw classid ${TC_ETH0_MAJOR}:${idx} 2>/dev/null || return 1
+    # lo class + fw filter
+    tc class replace dev "$LO_IFACE" parent ${TC_LO_MAJOR}: classid ${TC_LO_MAJOR}:${idx} htb rate ${rate}mbit ceil ${rate}mbit 2>/dev/null || return 1
+    tc filter replace dev "$LO_IFACE" parent ${TC_LO_MAJOR}: protocol ip prio 1 handle ${idx} fw classid ${TC_LO_MAJOR}:${idx} 2>/dev/null || return 1
+    return 0
+}
+
+remove_tc_class_for_user() {
+    local idx="$1"
+    tc class del dev "$ETH0_IFACE" classid ${TC_ETH0_MAJOR}:${idx} 2>/dev/null
+    tc filter del dev "$ETH0_IFACE" parent ${TC_ETH0_MAJOR}: protocol ip prio 1 handle ${idx} fw 2>/dev/null
+    tc class del dev "$LO_IFACE" classid ${TC_LO_MAJOR}:${idx} 2>/dev/null
+    tc filter del dev "$LO_IFACE" parent ${TC_LO_MAJOR}: protocol ip prio 1 handle ${idx} fw 2>/dev/null
+}
+
+# ============================================================
+# IPTABLES MARK MANAGEMENT (mangle OUTPUT, --uid-owner, --set-mark)
+# Pattern 49 v32 NEW: real-time packet marking per-UID
+# ============================================================
+
+add_iptables_mark_for_user() {
+    local uid="$1" idx="$2"
+    # Idempotent: check if rule exists
+    if iptables -t mangle -C OUTPUT -m owner --uid-owner "$uid" -j MARK --set-mark "$idx" 2>/dev/null; then
+        return 0
+    fi
+    iptables -t mangle -A OUTPUT -m owner --uid-owner "$uid" -j MARK --set-mark "$idx"
+}
+
+remove_iptables_mark_for_user() {
+    local uid="$1" idx="$2"
+    # Loop delete (in case of duplicate rules)
+    while iptables -t mangle -D OUTPUT -m owner --uid-owner "$uid" -j MARK --set-mark "$idx" 2>/dev/null; do :; done
+}
+
+# ============================================================
+# CMD: ADD USER TO BLACKLIST + APPLY RULES
+# NO Force Reconnect needed (iptables mark works on existing socket real-time)
+# ============================================================
+
+cmd_add() {
+    local user="$1" rate="$2"
+
+    if [ -z "$user" ] || [ -z "$rate" ]; then
+        echo -e "${RED}Error: Usage: bw-limit --add <user> <rate_mbps>${NC}"
+        return 1
+    fi
+
+    if ! is_valid_user "$user"; then
+        echo -e "${RED}Error: User '${user}' tidak valid (tidak ada di /etc/passwd)${NC}"
+        return 1
+    fi
+
+    if is_system_user "$user"; then
+        echo -e "${RED}Error: User '${user}' adalah system user — tidak boleh di-limit${NC}"
+        return 1
+    fi
+
+    if ! [[ "$rate" =~ ^[0-9]+$ ]] || [ "$rate" -lt 1 ] || [ "$rate" -gt 1000 ]; then
+        echo -e "${RED}Error: Rate harus integer 1-1000 Mbps${NC}"
+        return 1
+    fi
+
+    if is_user_in_blacklist "$user"; then
+        echo -e "${YELLOW}Warning: User '${user}' sudah ada di blacklist — akan di-replace${NC}"
+        cmd_remove "$user" >/dev/null 2>&1
+    fi
+
+    local uid
+    uid=$(get_uid_for_user "$user")
+    if [ -z "$uid" ]; then
+        echo -e "${RED}Error: Tidak bisa resolve UID untuk user '${user}'${NC}"
+        return 1
+    fi
+
+    local idx
+    idx=$(get_next_classid_index)
+
+    echo -e "${CYAN}=== ADD USER TO BLACKLIST + APPLY LIMIT ===${NC}"
+    echo -e "User      : ${YELLOW}${user}${NC}"
+    echo -e "UID       : ${YELLOW}${uid}${NC}"
+    echo -e "Rate      : ${YELLOW}${rate} Mbps${NC} (hard cap, P2=B v26 retained)"
+    echo -e "Class ID  : ${YELLOW}${idx}${NC} (eth0=${TC_ETH0_MAJOR}:${idx}, lo=${TC_LO_MAJOR}:${idx})"
+    echo -e "Mark      : ${YELLOW}${idx}${NC} (iptables -m owner --uid-owner ${uid} -j MARK --set-mark ${idx})"
+    echo
+
+    # Step 1/4: Setup tc root
+    echo -e "${GRAY}[1/4] Setup tc HTB root (eth0 + lo)...${NC}"
+    if setup_tc_root; then
+        echo -e "  ${GREEN}OK ✓${NC} eth0=${TC_ETH0_MAJOR}: htb, lo=${TC_LO_MAJOR}: htb, default ${TC_DEFAULT_CLASS_MINOR} (1Gbit)"
+    else
+        echo -e "  ${RED}FAIL${NC} — periksa tc binary + permission"
+        return 1
+    fi
+
+    # Step 2/4: Add tc class + filter (eth0 + lo)
+    echo -e "${GRAY}[2/4] Add tc class + fw filter (eth0 + lo)...${NC}"
+    if add_tc_class_for_user "$user" "$rate" "$idx"; then
+        echo -e "  ${GREEN}OK ✓${NC} class ${TC_ETH0_MAJOR}:${idx} (${rate}Mbit) + ${TC_LO_MAJOR}:${idx} (${rate}Mbit) + fw filter handle ${idx}"
+    else
+        echo -e "  ${RED}FAIL${NC}"
+        return 1
+    fi
+
+    # Step 3/4: Add iptables mark rule
+    echo -e "${GRAY}[3/4] Add iptables mangle OUTPUT mark rule...${NC}"
+    if add_iptables_mark_for_user "$uid" "$idx"; then
+        echo -e "  ${GREEN}OK ✓${NC} -m owner --uid-owner ${uid} -j MARK --set-mark ${idx}"
+    else
+        echo -e "  ${RED}FAIL${NC} — periksa iptables + CAP_NET_ADMIN"
+        remove_tc_class_for_user "$idx"
+        return 1
+    fi
+
+    # Step 4/4: Update blacklist + save iptables
+    echo -e "${GRAY}[4/4] Update blacklist + save iptables...${NC}"
+    add_user_to_blacklist "$user" "$rate" "$idx"
+    iptables-save > "$IPTABLES_SAVE_FILE"
+    echo -e "  ${GREEN}OK ✓${NC} blacklist updated: ${user}:${rate}:${idx}"
+    echo -e "  ${GREEN}OK ✓${NC} iptables saved to ${IPTABLES_SAVE_FILE}"
+
+    echo
+    echo -e "${GREEN}=== SETUP COMPLETE ===${NC}"
+    echo -e "User ${YELLOW}${user}${NC} (UID ${uid}) sekarang di-limit ${YELLOW}${rate} Mbps${NC} hard cap"
+    echo -e "${GRAY}Limit bekerja REAL-TIME untuk SEMUA socket (existing + new)${NC}"
+    echo -e "${GRAY}NO Force Reconnect needed (mark bekerja saat packet egress, BUKAN socket creation)${NC}"
+    echo -e "${GRAY}Limit aktif di eth0 (upload) + lo (download)${NC}"
+
+    log_msg "ADD user=$user uid=$uid rate=$rate idx=$idx — OK"
+}
+
+# ============================================================
+# CMD: REMOVE USER FROM BLACKLIST + CLEANUP RULES
+# ============================================================
 
 cmd_remove() {
     local user="$1"
-    
+
     if [ -z "$user" ]; then
-        echo -e "${RED}Usage: bw-limit --remove <user>${NC}"
+        echo -e "${RED}Error: Usage: bw-limit --remove <user>${NC}"
         return 1
     fi
-    
+
     if ! is_user_in_blacklist "$user"; then
-        echo -e "${YELLOW}User '${user}' TIDAK di blacklist${NC}"
-        return 1
+        echo -e "${YELLOW}Warning: User '${user}' tidak ada di blacklist — tidak ada yang dihapus${NC}"
+        return 0
     fi
-    
-    # Get current entry
-    local entry
+
+    local entry old_rate old_idx uid
     entry=$(get_user_blacklist_entry "$user")
-    local rate_mbps classid_index
-    rate_mbps=$(echo "$entry" | cut -d: -f2)
-    classid_index=$(echo "$entry" | cut -d: -f3)
-    
-    echo -e "${CYAN}=== REMOVE USER FROM BLACKLIST ===${NC}"
-    echo -e "User           : ${YELLOW}${user}${NC}"
-    echo -e "Rate           : ${YELLOW}${rate_mbps} Mbps${NC}"
-    echo -e "Classid index  : ${YELLOW}${classid_index}${NC}"
-    echo ""
-    
-    # Step 1: Remove tc filter
-    echo -e "${GRAY}[1/4] Remove tc filter prio ${classid_index}...${NC}"
-    remove_tc_filter_for_user "$classid_index"
-    echo -e "${GREEN}OK${NC}"
-    
-    # Step 2: Remove tc class
-    echo -e "${GRAY}[2/4] Remove tc class 16:${classid_index}...${NC}"
-    remove_tc_class_for_user "$classid_index"
-    echo -e "${GREEN}OK${NC}"
-    
-    # Step 3: Remove cgroup (PATTERN 39 - move PID ke root dulu)
-    echo -e "${GRAY}[3/4] Remove cgroup $(get_cgroup_name "$user") (PATTERN 39)...${NC}"
-    remove_cgroup_for_user "$user"
-    echo -e "${GREEN}OK${NC}"
-    
-    # Step 4: Remove from blacklist
-    echo -e "${GRAY}[4/4] Update blacklist file...${NC}"
+    old_rate=$(echo "$entry" | cut -d: -f2)
+    old_idx=$(echo "$entry" | cut -d: -f3)
+    uid=$(get_uid_for_user "$user")
+
+    echo -e "${CYAN}=== REMOVE USER FROM BLACKLIST + CLEANUP ===${NC}"
+    echo -e "User      : ${YELLOW}${user}${NC}"
+    echo -e "UID       : ${YELLOW}${uid}${NC}"
+    echo -e "Old Rate  : ${YELLOW}${old_rate} Mbps${NC}"
+    echo -e "Old Index : ${YELLOW}${old_idx}${NC}"
+    echo
+
+    # Step 1/3: Remove iptables mark rule
+    echo -e "${GRAY}[1/3] Remove iptables mangle mark rule...${NC}"
+    remove_iptables_mark_for_user "$uid" "$old_idx"
+    echo -e "  ${GREEN}OK ✓${NC} iptables mark rule untuk UID ${uid} idx ${old_idx} dihapus"
+
+    # Step 2/3: Remove tc class + filter
+    echo -e "${GRAY}[2/3] Remove tc class + fw filter (eth0 + lo)...${NC}"
+    remove_tc_class_for_user "$old_idx"
+    echo -e "  ${GREEN}OK ✓${NC} class ${TC_ETH0_MAJOR}:${old_idx} + ${TC_LO_MAJOR}:${old_idx} + filter dihapus"
+
+    # Step 3/3: Remove from blacklist + save iptables
+    echo -e "${GRAY}[3/3] Remove from blacklist + save iptables...${NC}"
     remove_user_from_blacklist "$user"
-    echo -e "${GREEN}OK${NC}"
-    
-    echo ""
-    echo -e "${CYAN}=== REMOVE COMPLETE ===${NC}"
-    echo -e "${GRAY}User '${user}' tidak di-limit lagi. Existing PID tetap connect.${NC}"
-    
-    log_msg "remove user: ${user} (rate=${rate_mbps}, idx=${classid_index})"
-    return 0
+    iptables-save > "$IPTABLES_SAVE_FILE"
+    echo -e "  ${GREEN}OK ✓${NC} blacklist entry dihapus"
+    echo -e "  ${GREEN}OK ✓${NC} iptables saved"
+
+    echo
+    echo -e "${GREEN}=== REMOVE COMPLETE ===${NC}"
+    echo -e "User ${YELLOW}${user}${NC} tidak lagi di-limit"
+    echo -e "${GRAY}Socket existing sekarang full speed (mark dihapus, packet ke default class)${NC}"
+
+    log_msg "REMOVE user=$user uid=$uid old_rate=$old_rate old_idx=$old_idx — OK"
 }
+
+# ============================================================
+# CMD: LIST BLACKLIST (simple table)
+# ============================================================
 
 cmd_list() {
-    if [ ! -f "$BLACKLIST_FILE" ] || [ ! -s "$BLACKLIST_FILE" ]; then
-        echo -e "${YELLOW}Blacklist kosong. Tidak ada user di-limit.${NC}"
-        echo -e "${GRAY}Tambah user: bw-limit --add <user> <rate_mbps>${NC}"
+    ensure_config_dir
+    if [ ! -s "$BLACKLIST_FILE" ]; then
+        echo -e "${YELLOW}Blacklist kosong — belum ada user di-limit${NC}"
         return 0
     fi
-    
-    echo -e "${CYAN}=== BLACKLIST STATUS ===${NC}"
-    echo ""
-    printf "%-15s %-12s %-12s %-10s %-15s %-10s\n" "USER" "RATE(Mbps)" "CLASSID(hex)" "TC CLASS" "CGROUP" "PID COUNT"
-    printf "%-15s %-12s %-12s %-10s %-15s %-10s\n" "----" "----------" "------------" "--------" "------" "---------"
-    
-    local user rate idx classid_hex tc_classid cgroup_name pid_list pid_count cgroup_status
+
+    echo -e "${CYAN}=== BANDWIDTH LIMIT BLACKLIST ===${NC}"
+    echo
+    printf "%-15s %-8s %-8s %-8s %-15s\n" "USER" "UID" "RATE" "IDX" "STATUS"
+    printf "%-15s %-8s %-8s %-8s %-15s\n" "---------------" "--------" "--------" "--------" "---------------"
+
+    local user rate idx uid iptables_status tc_status
     while IFS=: read -r user rate idx; do
         [ -z "$user" ] && continue
-        classid_hex=$(get_classid_hex "$idx")
-        tc_classid=$(get_tc_classid "$idx")
-        cgroup_name=$(get_cgroup_name "$user")
-        if [ -d "$cgroup_name" ]; then
-            cgroup_status="OK"
-            pid_list=$(resolve_dropbear_pids_for_user "$user")
-            if [ -n "$pid_list" ]; then
-                pid_count=$(echo "$pid_list" | wc -w | tr -d ' ')
-            else
-                pid_count=0
-            fi
+        uid=$(get_uid_for_user "$user")
+
+        # Check iptables rule exists
+        if iptables -t mangle -C OUTPUT -m owner --uid-owner "$uid" -j MARK --set-mark "$idx" 2>/dev/null; then
+            iptables_status="IPT OK"
         else
-            cgroup_status="MISSING"
-            pid_count="-"
+            iptables_status="IPT MISS"
         fi
-        printf "%-15s %-12s %-12s %-10s %-15s %-10s\n" "$user" "$rate" "$classid_hex" "$tc_classid" "$cgroup_status" "$pid_count"
+
+        # Check tc class exists (eth0)
+        if tc class show dev "$ETH0_IFACE" 2>/dev/null | grep -q "${TC_ETH0_MAJOR}:${idx} "; then
+            tc_status="TC OK"
+        else
+            tc_status="TC MISS"
+        fi
+
+        printf "%-15s %-8s %-8s %-8s %-15s\n" "$user" "$uid" "${rate}M" "$idx" "${iptables_status} ${tc_status}"
     done < "$BLACKLIST_FILE"
-    
-    echo ""
-    local total
-    total=$(wc -l < "$BLACKLIST_FILE" | tr -d ' ')
-    echo -e "${GRAY}Total: ${total} user di blacklist${NC}"
+
+    echo
+    echo -e "${GRAY}Total: $(wc -l < "$BLACKLIST_FILE") user di blacklist${NC}"
 }
+
+# ============================================================
+# CMD: SHOW DETAILED STATUS
+# ============================================================
 
 cmd_show() {
-    echo -e "${CYAN}=== BW-LIMIT DETAIL STATUS ===${NC}"
-    echo ""
-    
-    echo -e "${YELLOW}--- TC qdisc di ${LO_IFACE} ---${NC}"
-    tc qdisc show dev "$LO_IFACE" 2>/dev/null
-    echo ""
-    
-    echo -e "${YELLOW}--- TC classes di ${LO_IFACE} ---${NC}"
-    tc class show dev "$LO_IFACE" 2>/dev/null
-    echo ""
-    
-    echo -e "${YELLOW}--- TC filters di ${LO_IFACE} ---${NC}"
-    tc filter show dev "$LO_IFACE" 2>/dev/null
-    echo ""
-    
-    echo -e "${YELLOW}--- cgroup net_cls haxor_* dirs ---${NC}"
-    local found=0
-    for dir in "${CGROUP_BASE}/${CGROUP_PREFIX}"*; do
-        if [ -d "$dir" ]; then
-            local name classid tasks
-            name=$(basename "$dir")
-            classid=$(cat "${dir}/net_cls.classid" 2>/dev/null)
-            tasks=$(wc -l < "${dir}/tasks" 2>/dev/null | tr -d ' ')
-            echo -e "  ${GREEN}${name}${NC} classid=${classid} tasks=${tasks}"
-            if [ "${tasks:-0}" -gt 0 ] 2>/dev/null; then
-                echo -e "    PIDs: $(tr '\n' ' ' < "${dir}/tasks" 2>/dev/null)"
-            fi
-            found=1
-        fi
-    done
-    [ "$found" -eq 0 ] && echo -e "  ${GRAY}(tidak ada cgroup haxor_*)${NC}"
-    echo ""
-    
-    echo -e "${YELLOW}--- Blacklist file (${BLACKLIST_FILE}) ---${NC}"
-    if [ -f "$BLACKLIST_FILE" ] && [ -s "$BLACKLIST_FILE" ]; then
+    echo -e "${CYAN}=== BANDWIDTH LIMIT DETAILED STATUS ===${NC}"
+    echo
+
+    # Blacklist
+    echo -e "${YELLOW}--- BLACKLIST (${BLACKLIST_FILE}) ---${NC}"
+    if [ -s "$BLACKLIST_FILE" ]; then
         cat "$BLACKLIST_FILE"
     else
-        echo -e "  ${GRAY}(kosong atau tidak ada)${NC}"
+        echo -e "${GRAY}(kosong)${NC}"
     fi
+    echo
+
+    # iptables mangle OUTPUT
+    echo -e "${YELLOW}--- IPTABLES MANGLE OUTPUT ---${NC}"
+    iptables -t mangle -L OUTPUT -n -v --line-numbers 2>&1 | head -30
+    echo
+
+    # tc eth0
+    echo -e "${YELLOW}--- TC ETH0 (qdisc + class + filter) ---${NC}"
+    tc qdisc show dev "$ETH0_IFACE"
+    echo
+    tc class show dev "$ETH0_IFACE" 2>/dev/null | head -20
+    echo
+    tc filter show dev "$ETH0_IFACE" 2>/dev/null | head -10
+    echo
+
+    # tc lo
+    echo -e "${YELLOW}--- TC LO (qdisc + class + filter) ---${NC}"
+    tc qdisc show dev "$LO_IFACE"
+    echo
+    tc class show dev "$LO_IFACE" 2>/dev/null | head -20
+    echo
+    tc filter show dev "$LO_IFACE" 2>/dev/null | head -10
+    echo
+
+    # systemd service status
+    echo -e "${YELLOW}--- SYSTEMD INIT SERVICE ---${NC}"
+    systemctl is-active bw-limit-init.service 2>&1 || echo "(not installed)"
+    systemctl is-enabled bw-limit-init.service 2>&1 || echo "(not installed)"
+    echo
+
+    # Cron watcher status
+    echo -e "${YELLOW}--- CRON WATCHER ---${NC}"
+    echo -e "${GRAY}(v2.0 TIDAK pakai cron watcher — iptables mark bekerja real-time, no PID tracking)${NC}"
 }
 
-cmd_watch() {
-    echo -e "${CYAN}=== WATCH: Assign new Dropbear PID ke cgroup ===${NC}"
-    echo ""
-    
-    if [ ! -f "$BLACKLIST_FILE" ] || [ ! -s "$BLACKLIST_FILE" ]; then
-        echo -e "${YELLOW}Blacklist kosong. Tidak ada user untuk watch.${NC}"
-        return 0
-    fi
-    
-    local total_assigned=0
-    local user rate idx pid_list pid
-    
-    while IFS=: read -r user rate idx; do
-        [ -z "$user" ] && continue
-        
-        local cgroup_name
-        cgroup_name=$(get_cgroup_name "$user")
-        if [ ! -d "$cgroup_name" ]; then
-            echo -e "${RED}SKIP: cgroup untuk '${user}' TIDAK ADA (mungkin sudah di-remove)${NC}"
-            continue
-        fi
-        
-        pid_list=$(resolve_dropbear_pids_for_user "$user")
-        if [ -z "$pid_list" ]; then
-            echo -e "${GRAY}User '${user}': TIDAK ada Dropbear PID aktif (offline)${NC}"
-            continue
-        fi
-        
-        local assigned=0
-        for pid in $pid_list; do
-            if is_pid_in_cgroup "$pid" "$user"; then
-                echo -e "${GRAY}User '${user}' PID ${pid}: sudah di cgroup (skip)${NC}"
-            else
-                if assign_pid_to_cgroup "$pid" "$user"; then
-                    echo -e "${GREEN}User '${user}' PID ${pid}: assigned ke cgroup${NC}"
-                    log_msg "watch: assign PID ${pid} ke cgroup untuk user ${user}"
-                    assigned=$((assigned + 1))
-                    total_assigned=$((total_assigned + 1))
-                else
-                    echo -e "${RED}User '${user}' PID ${pid}: GAGAL assign${NC}"
-                fi
-            fi
-        done
-        
-        if [ "$assigned" -eq 0 ]; then
-            echo -e "${GRAY}User '${user}': tidak ada PID baru untuk assign${NC}"
-        fi
-    done < "$BLACKLIST_FILE"
-    
-    echo ""
-    echo -e "${CYAN}Total assigned: ${total_assigned} PID${NC}"
-    echo -e "${GRAY}Next: cron watcher (v28) akan auto-watch setiap 2 menit + flock${NC}"
-}
+# ============================================================
+# CMD: INIT (rebuild tc + iptables from blacklist — for systemd boot)
+# ============================================================
 
-# ============================================================================
-# cmd_init (NEW v28): Rebuild tc + cgroup dari blacklist.txt
-#   - Dipanggil oleh systemd init service saat VPS boot
-#   - Idempotent: aman dijalankan berkali-kali (tc class replace + cgroup reuse)
-#   - Hanya rebuild infrastructure (tc qdisc/class/filter + cgroup dirs)
-#   - TIDAK assign PID ke cgroup (PID belum ada saat boot — cron watcher akan handle)
-# ============================================================================
 cmd_init() {
-    echo -e "${CYAN}=== INIT: Rebuild tc + cgroup dari blacklist.txt ===${NC}"
-    echo ""
-    
+    echo -e "${CYAN}=== INIT: REBUILD TC + IPTABLES FROM BLACKLIST ===${NC}"
+    echo
+
     ensure_config_dir
-    
-    if [ ! -d "$CGROUP_BASE" ]; then
-        echo -e "${RED}ERROR: cgroup net_cls base dir TIDAK ADA di ${CGROUP_BASE}${NC}"
-        echo -e "${GRAY}(cgroup v1 net_cls tidak di-mount — cek kernel config / boot params)${NC}"
-        return 1
-    fi
-    
-    if ! command -v tc >/dev/null; then
-        echo -e "${RED}ERROR: tc binary TIDAK ADA${NC}"
-        return 1
-    fi
-    
-    if [ ! -f "$BLACKLIST_FILE" ] || [ ! -s "$BLACKLIST_FILE" ]; then
-        echo -e "${YELLOW}Blacklist kosong. Hanya setup tc root + default class.${NC}"
-        if ! setup_tc_root; then
-            echo -e "${RED}GAGAL setup tc root${NC}"
-            return 1
-        fi
-        echo -e "${GREEN}TC root setup OK (empty blacklist — siap untuk --add user baru)${NC}"
-        log_msg "init: tc root setup (empty blacklist)"
+
+    if [ ! -s "$BLACKLIST_FILE" ]; then
+        echo -e "${YELLOW}Blacklist kosong — setup tc root only${NC}"
+        setup_tc_root
+        echo -e "${GREEN}TC root setup OK (eth0 + lo)${NC}"
+        log_msg "INIT — blacklist empty, tc root only — OK"
         return 0
     fi
-    
-    # Step 1: Setup tc HTB root (idempotent)
-    echo -e "${GRAY}[1/2] Setup tc HTB root di ${LO_IFACE} (PATTERN 37)...${NC}"
-    if ! setup_tc_root; then
-        echo -e "${RED}GAGAL setup tc root${NC}"
-        return 1
-    fi
-    echo -e "${GREEN}OK${NC}"
-    
-    # Step 2: Rebuild per-user (cgroup + tc class + tc filter)
-    local total_rebuilt=0
-    local total_skip=0
-    local user rate idx
-    
-    echo ""
-    echo -e "${GRAY}[2/2] Rebuild per-user dari blacklist.txt...${NC}"
+
+    # Step 1/2: Setup tc root
+    echo -e "${GRAY}[1/2] Setup tc HTB root (eth0 + lo)...${NC}"
+    setup_tc_root
+    echo -e "  ${GREEN}OK ✓${NC}"
+
+    # Step 2/2: Rebuild per user
+    echo -e "${GRAY}[2/2] Rebuild user entries from blacklist...${NC}"
+    local count=0 skip=0
     while IFS=: read -r user rate idx; do
-        # Skip empty lines + comments
         [ -z "$user" ] && continue
-        [[ "$user" =~ ^# ]] && continue
-        
-        # Validate classid_index is integer
-        if ! [[ "$idx" =~ ^[0-9]+$ ]]; then
-            echo -e "${RED}SKIP: user '${user}' punya classid_index INVALID ('${idx}') — format harus user:rate:integer${NC}"
-            total_skip=$((total_skip + 1))
+
+        local uid
+        uid=$(get_uid_for_user "$user")
+        if [ -z "$uid" ]; then
+            echo -e "  ${YELLOW}SKIP${NC} user '${user}' — UID tidak resolve"
+            skip=$((skip + 1))
             continue
         fi
-        
-        # Validate rate is positive integer
-        if ! [[ "$rate" =~ ^[0-9]+$ ]] || [ "$rate" -lt 1 ] || [ "$rate" -gt 1000 ]; then
-            echo -e "${RED}SKIP: user '${user}' punya rate INVALID ('${rate}') — harus integer 1-1000${NC}"
-            total_skip=$((total_skip + 1))
+
+        if ! [[ "$rate" =~ ^[0-9]+$ ]] || [ "$rate" -lt 1 ]; then
+            echo -e "  ${YELLOW}SKIP${NC} user '${user}' — rate tidak valid: ${rate}"
+            skip=$((skip + 1))
             continue
         fi
-        
-        local classid_hex tc_classid cgroup_name
-        classid_hex=$(get_classid_hex "$idx")
-        tc_classid=$(get_tc_classid "$idx")
-        cgroup_name=$(get_cgroup_name "$user")
-        
-        echo -e "${GRAY}→ Rebuild user '${user}' (rate=${rate} Mbps, class=${tc_classid}, handle=${classid_hex})...${NC}"
-        
-        # Step 2a: Create cgroup (idempotent — reuse if exists, re-set classid)
-        if ! create_cgroup_for_user "$user" "$idx"; then
-            echo -e "${RED}  GAGAL create cgroup untuk '${user}'${NC}"
-            total_skip=$((total_skip + 1))
+
+        if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ]; then
+            echo -e "  ${YELLOW}SKIP${NC} user '${user}' — idx tidak valid: ${idx}"
+            skip=$((skip + 1))
             continue
         fi
-        
-        # Step 2b: Add tc class (idempotent via tc class replace)
-        if ! add_tc_class_for_user "$user" "$rate" "$idx"; then
-            echo -e "${RED}  GAGAL add tc class untuk '${user}'${NC}"
-            total_skip=$((total_skip + 1))
-            continue
-        fi
-        
-        # Step 2c: Add tc filter (idempotent — del existing + add new, PATTERN 40)
-        if ! add_tc_filter_for_user "$user" "$idx"; then
-            echo -e "${RED}  GAGAL add tc filter untuk '${user}'${NC}"
-            total_skip=$((total_skip + 1))
-            continue
-        fi
-        
-        echo -e "${GREEN}  OK: ${user} rebuilt (cgroup ${cgroup_name} + tc class ${tc_classid} + filter handle ${classid_hex})${NC}"
-        log_msg "init: rebuild tc + cgroup untuk user ${user} (idx=${idx}, rate=${rate})"
-        total_rebuilt=$((total_rebuilt + 1))
+
+        # Rebuild tc class + filter
+        add_tc_class_for_user "$user" "$rate" "$idx"
+        # Rebuild iptables mark (idempotent)
+        add_iptables_mark_for_user "$uid" "$idx"
+
+        echo -e "  ${GREEN}OK ✓${NC} user='${user}' uid=${uid} rate=${rate}M idx=${idx}"
+        count=$((count + 1))
     done < "$BLACKLIST_FILE"
-    
-    echo ""
-    echo -e "${CYAN}=== INIT COMPLETE ===${NC}"
-    echo -e "Total rebuilt : ${GREEN}${total_rebuilt}${NC} user"
-    [ "$total_skip" -gt 0 ] && echo -e "Total skip    : ${RED}${total_skip}${NC} user (lihat error di atas)"
-    echo ""
-    echo -e "${GRAY}Infrastructure (tc + cgroup) siap. PID assignment TIDAK dilakukan di init.${NC}"
-    echo -e "${GRAY}Cron watcher (*/2 * * * * + flock) akan auto-assign new PID ke cgroup.${NC}"
-    echo -e "${GRAY}Untuk assign PID sekarang (manual): bw-limit --watch${NC}"
+
+    # Save iptables
+    iptables-save > "$IPTABLES_SAVE_FILE"
+
+    echo
+    echo -e "${GREEN}=== INIT COMPLETE ===${NC}"
+    echo -e "Total rebuilt : ${YELLOW}${count}${NC} user"
+    echo -e "Total skip    : ${YELLOW}${skip}${NC} user"
+    echo -e "${GRAY}PID assignment TIDAK diperlukan (iptables mark bekerja real-time)${NC}"
+
+    log_msg "INIT — rebuilt ${count} user, skip ${skip} — OK"
 }
+
+# ============================================================
+# CMD: RESET (clear ALL tc + iptables, clear blacklist)
+# ============================================================
 
 cmd_reset() {
-    echo -e "${RED}=== RESET: Clear ALL tc + cgroup + blacklist ===${NC}"
-    echo ""
-    echo -e "${YELLOW}PERINGATAN: Ini akan menghapus:${NC}"
-    echo -e "  - Semua tc class + filter di ${LO_IFACE}"
-    echo -e "  - Restore qdisc ${LO_IFACE} ke noqueue (default)"
-    echo -e "  - Semua cgroup haxor_*"
-    echo -e "  - Blacklist file (${BLACKLIST_FILE})"
-    echo ""
-    echo -e "${RED}User di blacklist akan reconnect tanpa limit setelah ini${NC}"
-    echo ""
-    read -p "$(echo -e "${YELLOW}Ketik 'YA' (huruf besar) untuk konfirmasi: ${NC}")" confirm
-    
+    echo -e "${RED}=== WARNING: RESET ALL BANDWIDTH LIMIT ===${NC}"
+    echo -e "${RED}Ini akan menghapus SEMUA rule iptables mangle + tc class + blacklist${NC}"
+    echo
+    echo -e -n "${YELLOW}Ketik 'YA' (huruf besar) untuk konfirmasi: ${NC}"
+    read -r confirm
     if [ "$confirm" != "YA" ]; then
-        echo -e "${YELLOW}Reset dibatalkan.${NC}"
-        return 1
+        echo -e "${YELLOW}Dibatalkan${NC}"
+        return 0
     fi
-    
-    echo ""
-    echo -e "${GRAY}[1/4] Remove semua tc filter + class (delete qdisc root)...${NC}"
-    tc qdisc del dev "$LO_IFACE" root 2>/dev/null
-    echo -e "${GREEN}OK${NC}"
-    
-    echo -e "${GRAY}[2/4] Remove semua cgroup haxor_* (PATTERN 39)...${NC}"
-    local removed=0
-    for dir in "${CGROUP_BASE}/${CGROUP_PREFIX}"*; do
-        if [ -d "$dir" ]; then
-            # PATTERN 39: move PID ke root cgroup dulu
-            local pid
-            while IFS= read -r pid; do
-                [ -z "$pid" ] && continue
-                echo "$pid" > "${CGROUP_BASE}/tasks" 2>/dev/null
-            done < "${dir}/tasks" 2>/dev/null
-            rmdir "$dir" 2>/dev/null && echo -e "  ${GREEN}removed: $(basename "$dir")${NC}" || echo -e "  ${RED}GAGAL: $(basename "$dir")${NC}"
-            removed=$((removed + 1))
-        fi
+
+    echo
+    echo -e "${GRAY}[1/4] Remove semua iptables mark rules...${NC}"
+    # Parse mangle OUTPUT rules and delete MARK ones
+    iptables -t mangle -S OUTPUT 2>/dev/null | grep "MARK" | while read -r rule; do
+        local del_rule=${rule/-A/-D}
+        iptables -t mangle $del_rule 2>/dev/null
     done
-    [ "$removed" -eq 0 ] && echo -e "  ${GRAY}(tidak ada cgroup haxor_*)${NC}"
-    echo -e "${GREEN}OK${NC}"
-    
-    echo -e "${GRAY}[3/4] Clear blacklist file...${NC}"
+    echo -e "  ${GREEN}OK ✓${NC}"
+
+    echo -e "${GRAY}[2/4] Teardown tc (eth0 + lo)...${NC}"
+    teardown_tc_root
+    echo -e "  ${GREEN}OK ✓${NC} eth0 restored ke fq, lo cleared"
+
+    echo -e "${GRAY}[3/4] Clear blacklist...${NC}"
     ensure_config_dir
     > "$BLACKLIST_FILE"
-    echo -e "${GREEN}OK${NC}"
-    
-    echo -e "${GRAY}[4/4] Verify clean state...${NC}"
-    echo -e "  lo qdisc: $(tc qdisc show dev "$LO_IFACE" 2>/dev/null | head -1)"
-    local cg_count
-    cg_count=$(ls -d "${CGROUP_BASE}/${CGROUP_PREFIX}"* 2>/dev/null | wc -l | tr -d ' ')
-    echo -e "  cgroup haxor_*: ${cg_count} dir"
-    local bl_count
-    bl_count=$(wc -l < "$BLACKLIST_FILE" 2>/dev/null | tr -d ' ')
-    echo -e "  blacklist: ${bl_count} entry"
-    echo -e "${GREEN}OK${NC}"
-    
-    echo ""
-    echo -e "${CYAN}=== RESET COMPLETE ===${NC}"
-    log_msg "reset: ALL tc + cgroup + blacklist cleared"
+    echo -e "  ${GREEN}OK ✓${NC} blacklist dikosongkan"
+
+    echo -e "${GRAY}[4/4] Save iptables...${NC}"
+    iptables-save > "$IPTABLES_SAVE_FILE"
+    echo -e "  ${GREEN}OK ✓${NC}"
+
+    echo
+    echo -e "${GREEN}=== RESET COMPLETE ===${NC}"
+    echo -e "Semua rule dihapus, blacklist dikosongkan"
+
+    log_msg "RESET — all cleared"
 }
+
+# ============================================================
+# CMD: HELP
+# ============================================================
 
 cmd_help() {
     show_header
     cat <<EOF
 ${CYAN}USAGE:${NC}
-  bw-limit                         Interactive menu
-  bw-limit --list                  List blacklist + status
-  bw-limit --add <user> <mbps>     Add user ke blacklist + force reconnect
-  bw-limit --remove <user>         Remove user dari blacklist
-  bw-limit --show                  Show detail tc + cgroup
-  bw-limit --watch                 Manual trigger assign new PID ke cgroup
-  bw-limit --init                  Rebuild tc + cgroup dari blacklist.txt (untuk boot)
-  bw-limit --reset                 Clear ALL (confirmation "YA")
-  bw-limit --help                  This help
-  bw-limit --version               Version info
+  bw-limit [OPTIONS]
+  bw-limit --add <user> <rate_mbps>
+  bw-limit --remove <user>
+  bw-limit --list
+  bw-limit --show
+  bw-limit --init
+  bw-limit --reset
+  bw-limit --help
+  bw-limit --version
+
+${CYAN}OPTIONS:${NC}
+  --add <user> <mbps>     Add user ke blacklist + apply limit (NO Force Reconnect)
+  --remove <user>         Remove user dari blacklist + cleanup rules
+  --list                  List blacklist (simple table)
+  --show                  Detailed status (iptables + tc + systemd)
+  --init                  Rebuild tc + iptables dari blacklist (untuk systemd boot)
+  --reset                 Clear ALL (confirmation "YA" required)
+  --help                  Tampilkan help ini
+  --version               Tampilkan versi
 
 ${CYAN}EXAMPLES:${NC}
-  ${GRAY}# Add user 'anti' dengan limit 5 Mbps (hard cap, NO burst)${NC}
-  bw-limit --add anti 5
+  bw-limit --add nyunya 5        # Limit nyunya ke 5 Mbps (hard cap)
+  bw-limit --add anti 3          # Limit anti ke 3 Mbps
+  bw-limit --list                # Lihat semua user di blacklist
+  bw-limit --remove nyunya       # Hapus limit untuk nyunya
+  bw-limit --show                # Audit detail status
+  bw-limit --init                # Rebuild dari blacklist (boot time)
 
-  ${GRAY}# List semua user di blacklist${NC}
-  bw-limit --list
-
-  ${GRAY}# Remove user 'anti' dari blacklist${NC}
-  bw-limit --remove anti
-
-  ${GRAY}# Assign new PID ke cgroup setelah user reconnect${NC}
-  bw-limit --watch
-
-  ${GRAY}# Rebuild tc + cgroup dari blacklist (untuk systemd init saat boot)${NC}
-  bw-limit --init
-
-${CYAN}DESIGN (v26 FINAL + v28 UPDATE):${NC}
-  P1=B  Combined limit (download + upload gabung, egress di lo)
-  P2=B  Hard cap (rate=ceil, NO burst)
-  P3=C  Manual input rate per user (no default)
-  P4=B  Cron 2 menit + flock -n (LIVE v28: /etc/cron.d/bw-limit)
-  INIT systemd v28: /etc/systemd/system/bw-limit-init.service (Type=oneshot)
-
-${CYAN}ARCHITECTURE (Pattern 36+37+38+39 v26):${NC}
-  ${GRAY}- tc HTB root di lo interface (BUKAN eth0, PATTERN 37)${NC}
-  ${GRAY}- cgroup net_cls v1 classid 0x10000N = tc class 16:N (PATTERN 36)${NC}
-  ${GRAY}- Option B Force Reconnect: kill existing PID, reconnect 30 detik (PATTERN 38)${NC}
-  ${GRAY}- cgroup cleanup: move PID ke root cgroup sebelum rmdir (PATTERN 39)${NC}
-
-${CYAN}LIMITATION (LESSON 48 v26):${NC}
-  ${GRAY}cgroup net_cls v1 set sk_classid di SOCKET CREATION TIME${NC}
-  ${GRAY}Existing socket TIDAK update classid saat PID di-move ke cgroup${NC}
-  ${GRAY}Solution: kill -TERM existing PID → user reconnect → new socket marked${NC}
+${CYAN}DESIGN v2.0 (PATH X SUCCESS foundation):${NC}
+  - iptables MARK per-UID (mangle OUTPUT, -m owner --uid-owner)
+  - tc HTB di eth0 (shape upload) + tc HTB di lo (shape download)
+  - tc fw classifier (handle MARK fw flowid CLASS)
+  - Hard cap (rate=ceil, no burst)
+  - Blacklist manual by admin (P3=C v26 retained)
+  - NO cgroup (chicken-and-egg v29 SOLVED by iptables real-time mark)
+  - NO cron watcher (iptables rules persistent)
+  - NO Force Reconnect (mark works on existing socket real-time)
 
 ${CYAN}FILES:${NC}
-  /usr/bin/bw-limit                 Script ini
-  /etc/bw-limit/blacklist.txt       Blacklist (user:rate_mbps:classid_index)
-  /etc/cron.d/bw-limit              Cron watcher (*/2 * * * * + flock -n) [v28]
-  /etc/systemd/system/bw-limit-init.service  Init service untuk boot [v28]
+  /usr/bin/bw-limit                 Script utama
+  /etc/bw-limit/blacklist.txt       Blacklist (format: user:rate_mbps:classid_index)
+  /etc/bw-limit/iptables-rules.save Iptables rules save (for restore)
+  /etc/systemd/system/bw-limit-init.service  systemd init (rebuild on boot)
   /var/log/bw-limit.log             Event log
 
-${CYAN}ETHICAL COMMITMENT (v21-v26 RETAINED):${NC}
-  ${GRAY}- NO tendang/throttle SEMUA user (global cap)${NC}
-  ${GRAY}- Throttle BOLEH untuk user blacklist (manual by admin, BUKAN auto-kick)${NC}
-  ${GRAY}- Option B Force Reconnect = brief disconnect 30 detik untuk user blacklist${NC}
-  ${GRAY}  (BUKAN tendang semua user, hanya user yang di-blacklist)${NC}
+${CYAN}ETIKA (KOMITMEN USER v21+v24):${NC}
+  - Throttle HANYA untuk user blacklist manual by admin
+  - BUKAN auto-kick, BUKAN throttle semua user
+  - User normal tetap full speed (default class 1Gbit)
 
-${CYAN}BELITONG: DEKENG ANE BIAK BELITONG${NC}
+${CYAN}LIMITATION:${NC}
+  - Hanya bekerja untuk user yang login via Dropbear 2026.94+ (UID=user post-auth)
+  - User yang login via SSH direct (port 22) juga work (UID=user via PAM)
+  - TIDAK bekerja untuk Dropbear 2019.78 (UID=root — chicken-and-egg v29)
 EOF
 }
 
-# ============================================================================
-# Interactive Menu (Pattern 1+3 - re-entrant while-loop)
-# ============================================================================
+# ============================================================
+# INTERACTIVE MENU (Pattern 1+3 — re-entrant while-loop)
+# ============================================================
 
 show_menu() {
-    show_header
-    echo -e "${CYAN}MENU:${NC}"
-    echo ""
-    printf "  ${YELLOW}01${NC}) List Blacklist\n"
-    printf "  ${YELLOW}02${NC}) Add User ke Blacklist (force reconnect)\n"
-    printf "  ${YELLOW}03${NC}) Remove User dari Blacklist\n"
-    printf "  ${YELLOW}04${NC}) Show Detail (tc + cgroup)\n"
-    printf "  ${YELLOW}05${NC}) Watch (assign new PID ke cgroup)\n"
-    printf "  ${YELLOW}06${NC}) Init (rebuild tc + cgroup dari blacklist) [NEW v28]\n"
-    printf "  ${YELLOW}07${NC}) Reset (clear ALL)\n"
-    printf "  ${YELLOW}08${NC}) Help\n"
-    printf "  ${YELLOW}0X${NC}) Exit\n"
-    echo ""
-    read -p "$(echo -e "${GRAY}Pilih opsi [01-08 / 0X]: ${NC}")" choice
+    while true; do
+        clear
+        show_header
+        echo
+        echo -e "${YELLOW}MONITORING & TOOLS:${NC}"
+        echo -e "  ${CYAN}01${NC}) List Blacklist"
+        echo -e "  ${CYAN}02${NC}) Add User (limit bandwidth)"
+        echo -e "  ${CYAN}03${NC}) Remove User"
+        echo -e "  ${CYAN}04${NC}) Show Detail Status"
+        echo -e "  ${CYAN}05${NC}) Init (rebuild from blacklist)"
+        echo -e "  ${CYAN}06${NC}) Reset (clear ALL)"
+        echo -e "  ${CYAN}07${NC}) Help"
+        echo
+        echo -e "  ${GRAY}[0X] Exit${NC}"
+        echo
+        echo -e -n "${GRAY}Pilih opsi [01-07 / 0X]: ${NC}"
+        read -r choice
+        handle_choice "$choice"
+    done
 }
 
 handle_choice() {
-    local choice="$1"
-    case "$choice" in
+    case "$1" in
         01|1)
             clear
             cmd_list
@@ -1098,21 +666,26 @@ handle_choice() {
             ;;
         02|2)
             clear
-            echo -e "${CYAN}=== ADD USER KE BLACKLIST ===${NC}"
-            echo ""
-            read -p "$(echo -e "${GRAY}Username: ${NC}")" add_user
-            read -p "$(echo -e "${GRAY}Rate (Mbps, 1-1000): ${NC}")" add_rate
-            echo ""
+            echo -e "${CYAN}=== ADD USER TO BLACKLIST ===${NC}"
+            echo
+            echo -e -n "${GRAY}Masukkan username: ${NC}"
+            read -r add_user
+            echo -e -n "${GRAY}Masukkan rate (Mbps, 1-1000): ${NC}"
+            read -r add_rate
+            echo
             cmd_add "$add_user" "$add_rate"
             pause
             ;;
         03|3)
             clear
-            echo -e "${CYAN}=== REMOVE USER DARI BLACKLIST ===${NC}"
-            echo ""
-            read -p "$(echo -e "${GRAY}Username: ${NC}")" rm_user
-            echo ""
-            cmd_remove "$rm_user"
+            echo -e "${CYAN}=== REMOVE USER FROM BLACKLIST ===${NC}"
+            echo
+            cmd_list
+            echo
+            echo -e -n "${GRAY}Masukkan username yang akan di-remove: ${NC}"
+            read -r rem_user
+            echo
+            cmd_remove "$rem_user"
             pause
             ;;
         04|4)
@@ -1122,66 +695,66 @@ handle_choice() {
             ;;
         05|5)
             clear
-            cmd_watch
+            cmd_init
             pause
             ;;
         06|6)
             clear
-            cmd_init
-            pause
-            ;;
-        07|7)
-            clear
             cmd_reset
             pause
             ;;
-        08|8)
+        07|7)
             clear
             cmd_help
             pause
             ;;
         0|00|x|X|0x|0X)
             clear
+            echo -e "${GRAY}Exit bw-limit. Balik ke menu utama...${NC}"
+            sleep 1
             exit 0
             ;;
         *)
-            echo -e "${RED}Opsi tidak dikenal: ${choice}${NC}"
-            echo -e "${GRAY}Pilihan valid: 01-08 atau 0X (exit)${NC}"
+            echo -e "${RED}Opsi tidak dikenal. Pilih: 01-07 atau 0X (exit)${NC}"
             sleep 2
             ;;
     esac
 }
 
-# ============================================================================
-# Main Entry Point
-# ============================================================================
+# ============================================================
+# MAIN
+# ============================================================
 
 main() {
-    # Root check (cgroup + tc require root)
+    # Root check (iptables + tc butuh CAP_NET_ADMIN)
     if [ "$(id -u)" -ne 0 ]; then
-        echo -e "${RED}ERROR: bw-limit harus dijalankan sebagai root${NC}"
-        echo -e "${GRAY}(cgroup net_cls + tc membutuhkan akses root)${NC}"
+        echo -e "${RED}Error: bw-limit harus dijalankan sebagai root${NC}"
+        echo -e "${GRAY}(iptables + tc butuh CAP_NET_ADMIN)${NC}"
         exit 1
     fi
-    
-    # Parse CLI args
+
+    # Validate required commands (Pattern 6)
+    local cmds=(iptables tc id grep awk sed)
+    for cmd in "${cmds[@]}"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            echo -e "${RED}Error: command '${cmd}' tidak ditemukan${NC}"
+            exit 1
+        fi
+    done
+
+    # CLI dispatch
     case "${1:-}" in
+        --add)
+            cmd_add "$2" "$3"
+            ;;
+        --remove)
+            cmd_remove "$2"
+            ;;
         --list)
             cmd_list
             ;;
-        --add)
-            shift
-            cmd_add "$@"
-            ;;
-        --remove)
-            shift
-            cmd_remove "$@"
-            ;;
         --show)
             cmd_show
-            ;;
-        --watch)
-            cmd_watch
             ;;
         --init)
             cmd_init
@@ -1193,19 +766,17 @@ main() {
             cmd_help
             ;;
         --version|-v)
-            echo "bw-limit v${SCRIPT_VERSION} (Sesi 2.8-B - v28)"
-            echo "HAXOR TUNNELING - DEKENG ANE BIAK BELITONG"
+            echo "bw-limit v${SCRIPT_VERSION} (Sesi 2.9-A - v32)"
+            echo "HAXOR TUNNELING — DEKENG ANE BIAK BELITONG"
+            echo "iptables MARK per-UID + tc HTB (eth0+lo)"
             ;;
         "")
-            # Interactive menu (Pattern 1+3 - re-entrant while-loop)
-            while true; do
-                show_menu
-                handle_choice "$choice"
-            done
+            # Interactive menu
+            show_menu
             ;;
         *)
-            echo -e "${RED}Unknown command: ${1}${NC}"
-            echo -e "${GRAY}Run 'bw-limit --help' for usage${NC}"
+            echo -e "${RED}Unknown option: $1${NC}"
+            echo "Run 'bw-limit --help' for usage"
             exit 1
             ;;
     esac
