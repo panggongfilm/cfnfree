@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
 # Script  : bw-limit.sh
-# Version : v2.1 (Sesi 2.10 - v34) — IPTABLES MARK per-UID + DYNAMIC per-ephemeral + tc HTB
+# Version : v2.1-FIX1 (Sesi 2.11 - v35) — FIX1 setup_tc_root + remove_tc_class_for_user (BUG v34: tc qdisc replace GAGAL + tc class orphan)
 # Path    : /ssh/bw-limit.sh
 # Brand   : HAXOR TUNNELING
 # Tagline : DEKENG ANE BIAK BELITONG
@@ -39,7 +39,7 @@
 # ============================================================
 # CONSTANTS
 # ============================================================
-SCRIPT_VERSION="2.1"
+SCRIPT_VERSION="2.1-FIX1"
 CONFIG_DIR="/etc/bw-limit"
 BLACKLIST_FILE="${CONFIG_DIR}/blacklist.txt"
 IPTABLES_SAVE_FILE="${CONFIG_DIR}/iptables-rules.save"
@@ -82,7 +82,7 @@ BG_TEAL=$'\033[48;5;30m'
 
 show_header() {
     echo -e "${BG_CYAN}${WHITE}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BG_CYAN}${WHITE}║          BANDWIDTH LIMIT v2.1 - HAXOR TUNNELING              ║${NC}"
+    echo -e "${BG_CYAN}${WHITE}║          BANDWIDTH LIMIT v2.1-FIX1 - HAXOR TUNNELING          ║${NC}"
     echo -e "${BG_CYAN}${WHITE}║              DEKENG ANE BIAK BELITONG                        ║${NC}"
     echo -e "${BG_TEAL}${WHITE}║  iptables MARK per-UID + dynamic per-ephemeral + tc HTB     ║${NC}"
     echo -e "${BG_TEAL}${WHITE}╚══════════════════════════════════════════════════════════════╝${NC}"
@@ -312,12 +312,23 @@ remove_user_from_blacklist() {
 # ============================================================
 
 setup_tc_root() {
+    # FIX1-A v35: cek existing qdisc dulu, skip kalau sudah HTB valid
+    # BUG v34: tc qdisc replace GAGAL exit code 2 kalau qdisc root HTB sudah exist dengan child class
+    # (Error: "Change operation not supported by specified qdisc")
+    # Solution: cek dulu, kalau sudah HTB → skip qdisc add, baru tc class replace (idempotent)
+
     # eth0: HTB root, default class 9999 (1Gbit unlimited)
-    tc qdisc replace dev "$ETH0_IFACE" root handle ${TC_ETH0_MAJOR}: htb default ${TC_DEFAULT_CLASS_MINOR} 2>/dev/null || return 1
+    if ! tc qdisc show dev "$ETH0_IFACE" 2>/dev/null | grep -q "htb ${TC_ETH0_MAJOR}:"; then
+        # qdisc belum ada, atau bukan HTB — add baru
+        tc qdisc add dev "$ETH0_IFACE" root handle ${TC_ETH0_MAJOR}: htb default ${TC_DEFAULT_CLASS_MINOR} 2>/dev/null || return 1
+    fi
+    # tc class replace idempotent (selalu OK, walau class sudah ada)
     tc class replace dev "$ETH0_IFACE" parent root classid ${TC_ETH0_MAJOR}:${TC_DEFAULT_CLASS_MINOR} htb rate 1000mbit ceil 1000mbit 2>/dev/null || return 1
 
     # lo: HTB root, default class 9999 (1Gbit unlimited)
-    tc qdisc replace dev "$LO_IFACE" root handle ${TC_LO_MAJOR}: htb default ${TC_DEFAULT_CLASS_MINOR} 2>/dev/null || return 1
+    if ! tc qdisc show dev "$LO_IFACE" 2>/dev/null | grep -q "htb ${TC_LO_MAJOR}:"; then
+        tc qdisc add dev "$LO_IFACE" root handle ${TC_LO_MAJOR}: htb default ${TC_DEFAULT_CLASS_MINOR} 2>/dev/null || return 1
+    fi
     tc class replace dev "$LO_IFACE" parent root classid ${TC_LO_MAJOR}:${TC_DEFAULT_CLASS_MINOR} htb rate 1000mbit ceil 1000mbit 2>/dev/null || return 1
     return 0
 }
@@ -342,10 +353,37 @@ add_tc_class_for_user() {
 
 remove_tc_class_for_user() {
     local idx="$1"
-    tc class del dev "$ETH0_IFACE" classid ${TC_ETH0_MAJOR}:${idx} 2>/dev/null
+    # FIX1-B v35: hapus filter DULU, baru class, dengan retry + verify
+    # BUG v34: class orphan (rate lama tetap ada) karena filter masih reference class
+    # saat tc class del dipanggil — class tidak bisa dihapus
+    # Solution: hapus filter DULU supaya class bisa dihapus, lalu retry + verify hapus benar-benar bersih
+
+    # eth0: hapus filter dulu, baru class dengan retry
     tc filter del dev "$ETH0_IFACE" parent ${TC_ETH0_MAJOR}: protocol ip prio 1 handle ${idx} fw 2>/dev/null
-    tc class del dev "$LO_IFACE" classid ${TC_LO_MAJOR}:${idx} 2>/dev/null
+    local retry=0
+    while [ $retry -lt 3 ]; do
+        tc class del dev "$ETH0_IFACE" classid ${TC_ETH0_MAJOR}:${idx} 2>/dev/null
+        # verify hapus: cek apakah class masih ada
+        if ! tc class show dev "$ETH0_IFACE" parent ${TC_ETH0_MAJOR}: 2>/dev/null | grep -qw "${TC_ETH0_MAJOR}:${idx}"; then
+            break
+        fi
+        retry=$((retry + 1))
+        log_msg "WARN: eth0 class ${TC_ETH0_MAJOR}:${idx} masih ada setelah del (retry $retry/3)"
+        sleep 0.3
+    done
+
+    # lo: hapus filter dulu, baru class dengan retry
     tc filter del dev "$LO_IFACE" parent ${TC_LO_MAJOR}: protocol ip prio 1 handle ${idx} fw 2>/dev/null
+    retry=0
+    while [ $retry -lt 3 ]; do
+        tc class del dev "$LO_IFACE" classid ${TC_LO_MAJOR}:${idx} 2>/dev/null
+        if ! tc class show dev "$LO_IFACE" parent ${TC_LO_MAJOR}: 2>/dev/null | grep -qw "${TC_LO_MAJOR}:${idx}"; then
+            break
+        fi
+        retry=$((retry + 1))
+        log_msg "WARN: lo class ${TC_LO_MAJOR}:${idx} masih ada setelah del (retry $retry/3)"
+        sleep 0.3
+    done
 }
 
 # ============================================================
@@ -1317,7 +1355,7 @@ main() {
             cmd_help
             ;;
         --version|-v)
-            echo "bw-limit v${SCRIPT_VERSION} (Sesi 2.10 - v34)"
+            echo "bw-limit v${SCRIPT_VERSION} (Sesi 2.11 - v35 — FIX1 setup_tc_root + remove_tc_class_for_user)"
             echo "HAXOR TUNNELING — DEKENG ANE BIAK BELITONG"
             echo "iptables MARK per-UID + dynamic per-ephemeral + tc HTB (eth0+lo)"
             ;;
