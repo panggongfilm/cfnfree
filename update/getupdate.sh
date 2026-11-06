@@ -1,9 +1,10 @@
 #!/bin/bash
 # ==========================================
-# HAXOR PANEL TUNNELING — Auto Update Script (v16)
+# HAXOR PANEL TUNNELING — Auto Update Script (v17)
 # Tagline: DEKENG ANE BIAK BELITONG
 # Source : Adaptasi dari script open-source (lizsvr/cfnfree)
 # ==========================================
+# v17 (v41): added banner-manager auto-install (4 opsi interactive + 3 layer safety)
 # v16 (v39): added upgrade-dropbear auto-install (Dropbear 2026.94 PATH X)
 # v15 (v35): updated note bw-limit post-install steps (3 commands)
 # v14 (v28): added bw-limit + pantau + tendang-safe auto-install
@@ -41,7 +42,7 @@ cd /usr/bin
 # remove file
 rm menu
 rm -rf menu
-# Download update (6 menu files + 9 utility Fase 1+2 HAXOR)
+# Download update (6 menu files + 10 utility Fase 1+2+3 HAXOR)
 # Note post-install untuk masing-masing utility:
 #   - bw-user        : butuh 'sudo bw-user --setup' (cron + dirs)
 #   - pantau          : siap pakai (no setup needed)
@@ -69,6 +70,11 @@ rm -rf menu
 #                        upgrade binary Dropbear 2019.78 → 2026.94. WAJIB dijalankan
 #                        kalau VPS baru BELUM punya Dropbear 2026.94 (tanpa ini,
 #                        bw-limit shaping TIDAK akan work — Dropbear child UID=root)
+#   - banner-manager    : siap pakai (download only). Interactive banner manager untuk
+#                        /etc/issue.net. 4 opsi: tampilkan + edit + template + reset.
+#                        Banner langsung aktif untuk koneksi baru (NO restart service).
+#                        3 layer safety: preview confirm + backup timestamp + validate input.
+#                        Akses via menu utama [07] Banner Manager.
 # Detail: jalankan 'bw-limit --help' setelah install
 wget -O menu "https://${lizupdate}/menu.sh"
 wget -O maddssh "https://${lizupdate}/maddssh.sh"
@@ -88,6 +94,8 @@ wget -O tendang-safe "https://${lizssh}/tendang-safe.sh"
 wget -O bw-limit "https://${lizssh}/bw-limit.sh"
 # Download utility Fase 3 (PATH X automation — upgrade Dropbear binary)
 wget -O upgrade-dropbear "https://${lizssh}/upgrade-dropbear.sh"
+# Download utility Fase 3 (banner-manager — interactive banner manager HAXOR)
+wget -O banner-manager "https://${lizssh}/banner-manager.sh"
 # change Permission
 chmod +x menu
 chmod +x maddssh
@@ -104,11 +112,12 @@ chmod +x pantau
 chmod +x tendang-safe
 chmod +x bw-limit
 chmod +x upgrade-dropbear
+chmod +x banner-manager
 #change direct
 cd /root
 # clear
 clear
-echo -e "Succes Update Menu + Utility Fase 1+2+3 HAXOR"
+echo -e "Succes Update Menu + Utility Fase 1+2+3 HAXOR (+ banner-manager v41)"
 
 # === AUTO-SETUP bw-limit (optional, only if bw-limit installed + blacklist existing) ===
 # Kalau fresh VPS dengan blacklist existing (dari backup/restore), auto-setup:
