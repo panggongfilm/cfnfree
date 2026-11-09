@@ -1,9 +1,10 @@
 #!/bin/bash
 # ==========================================
-# HAXOR PANEL TUNNELING — Auto Update Script (v17)
+# HAXOR PANEL TUNNELING — Auto Update Script (v18)
 # Tagline: DEKENG ANE BIAK BELITONG
 # Source : Adaptasi dari script open-source (lizsvr/cfnfree)
 # ==========================================
+# v18 (v43): added auto-restart auto-install (cron watcher untuk service tunneling down)
 # v17 (v41): added banner-manager auto-install (4 opsi interactive + 3 layer safety)
 # v16 (v39): added upgrade-dropbear auto-install (Dropbear 2026.94 PATH X)
 # v15 (v35): updated note bw-limit post-install steps (3 commands)
@@ -42,7 +43,7 @@ cd /usr/bin
 # remove file
 rm menu
 rm -rf menu
-# Download update (6 menu files + 10 utility Fase 1+2+3 HAXOR)
+# Download update (6 menu files + 11 utility Fase 1+2+3 HAXOR)
 # Note post-install untuk masing-masing utility:
 #   - bw-user        : butuh 'sudo bw-user --setup' (cron + dirs)
 #   - pantau          : siap pakai (no setup needed)
@@ -75,6 +76,12 @@ rm -rf menu
 #                        Banner langsung aktif untuk koneksi baru (NO restart service).
 #                        3 layer safety: preview confirm + backup timestamp + validate input.
 #                        Akses via menu utama [07] Banner Manager.
+#   - auto-restart      : siap pakai (download only). Cron watcher untuk auto-restart
+#                        service tunneling saat down/crash (ssh/dropbear/sslh/stunnel5/nginx
+#                        ATAU badvpn-udpgw missing). Schedule */10 menit + flock -n.
+#                        Post-install WAJIB: setup cron manual (lihat AUTO-SETUP section di
+#                        bawah — auto-restart cron TIDAK otomatis, harus dibuat manual via
+#                        crontab ATAU ikuti template di bawah).
 # Detail: jalankan 'bw-limit --help' setelah install
 wget -O menu "https://${lizupdate}/menu.sh"
 wget -O maddssh "https://${lizupdate}/maddssh.sh"
@@ -96,6 +103,8 @@ wget -O bw-limit "https://${lizssh}/bw-limit.sh"
 wget -O upgrade-dropbear "https://${lizssh}/upgrade-dropbear.sh"
 # Download utility Fase 3 (banner-manager — interactive banner manager HAXOR)
 wget -O banner-manager "https://${lizssh}/banner-manager.sh"
+# Download utility Fase 3 (auto-restart — cron watcher untuk service tunneling down)
+wget -O auto-restart "https://${lizssh}/auto-restart"
 # change Permission
 chmod +x menu
 chmod +x maddssh
@@ -113,11 +122,12 @@ chmod +x tendang-safe
 chmod +x bw-limit
 chmod +x upgrade-dropbear
 chmod +x banner-manager
+chmod +x auto-restart
 #change direct
 cd /root
 # clear
 clear
-echo -e "Succes Update Menu + Utility Fase 1+2+3 HAXOR (+ banner-manager v41)"
+echo -e "Succes Update Menu + Utility Fase 1+2+3 HAXOR (+ banner-manager v41 + auto-restart v43)"
 
 # === AUTO-SETUP bw-limit (optional, only if bw-limit installed + blacklist existing) ===
 # Kalau fresh VPS dengan blacklist existing (dari backup/restore), auto-setup:
