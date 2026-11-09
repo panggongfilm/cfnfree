@@ -1,0 +1,88 @@
+#!/bin/bash
+# ============================================================================
+# Script  : auto-restart
+# Version : 1.0 (Sesi 2.9 - v43: Auto-restart install untuk VPS production)
+# HAXOR PANEL TUNNELING
+# Tagline : DEKENG ANE BIAK BELITONG
+# Lokasi  : /usr/bin/auto-restart (lokasi BELITONG #14 NEW v43)
+# Source  : Original HAXOR wrapper — reconstruct dari v22-Sesi-2.7-Auto-Restart
+#           (worklog PART-2), design awal v22 untuk VPS lama, sekarang install
+#           di VPS production 116.212.72.178
+# ----------------------------------------------------------------------------
+# Fungsi  : Cron watcher untuk auto-restart service tunneling saat down/crash
+# Trigger : 2 condition (salah satu terpenuhi = restart service tunneling):
+#           1. systemctl is-active != active untuk salah satu service:
+#              ssh, dropbear, sslh, stunnel5, nginx
+#           2. pgrep -x badvpn-udpgw kosong (process crash/hilang)
+# Method  : Panggil /usr/bin/sslh-fix-reboot (sama seperti menu no.02 manual)
+#           sslh-fix-reboot TIDAK reboot VPS, hanya restart service tunneling
+#           (verified v38 — 5 marker empirical proof: uptime kontinu + SSH
+#           admin tetap connect + no admin reconnect + no system boot entry
+#           + service restart berhasil)
+# Cron    : */10 * * * * root flock -n /tmp/auto-restart.lock
+#           /usr/bin/auto-restart >/dev/null 2>&1
+#           flock -n = skip silently kalau run sebelumnya masih jalan
+#           (PATTERN 35 — anti cron pile-up)
+#           interval 10 menit = match VPS 2 core capacity (PATTERN 34)
+# Log     : /var/log/auto-restart.log (hanya berisi event restart,
+#           silent saat sehat — no log entry)
+# Etika   : Auto-restart BOLEH untuk service down (komitmen user v21-v42)
+#           BUKAN tendang/throttle user heavy bandwidth (pindahkan ke server lain)
+#           TIDAK ada auto-kick untuk user heavy bandwidth
+# Note v42: auto-restart panggil sslh-fix-reboot yang TIDAK menyentuh badvpn.
+#           Kalau SCREEN anomali muncul lagi (LESSON 76 v42 — SCREEN parent
+#           process CPU > 10%), auto-restart TIDAK akan solve. Perlu design
+#           script baru untuk auto-handle SCREEN anomali (kandidat v44+ kalau
+#           user mau) — script baru akan: killall badvpn-udpgw + /etc/rc.local
+# ============================================================================
+
+LOG_FILE="/var/log/auto-restart.log"
+RESTART_CMD="/usr/bin/sslh-fix-reboot"
+SERVICES="ssh dropbear sslh stunnel5 nginx"
+
+log_msg() {
+    echo "[$(date '+%Y-%m-%dT%H:%M:%S%z')] $1" >> "$LOG_FILE"
+}
+
+# Pre-flight: pastikan RESTART_CMD executable
+if [ ! -x "$RESTART_CMD" ]; then
+    log_msg "ERROR — $RESTART_CMD tidak executable atau tidak ada"
+    exit 1
+fi
+
+# Trigger 1: cek service tunneling via systemctl is-active
+SERVICE_DOWN=""
+for svc in $SERVICES; do
+    state=$(systemctl is-active "$svc" 2>/dev/null)
+    if [ "$state" != "active" ]; then
+        SERVICE_DOWN="$svc"
+        break
+    fi
+done
+
+# Trigger 2: cek badvpn-udpgw process
+BADVPN_MISSING=""
+if ! pgrep -x badvpn-udpgw > /dev/null 2>&1; then
+    BADVPN_MISSING="badvpn-udpgw"
+fi
+
+# Decision: restart kalau salah satu trigger terpenuhi
+if [ -n "$SERVICE_DOWN" ] || [ -n "$BADVPN_MISSING" ]; then
+    log_msg "=== TRIGGER DETECTED ==="
+    if [ -n "$SERVICE_DOWN" ]; then
+        state_now=$(systemctl is-active "$SERVICE_DOWN" 2>/dev/null)
+        log_msg "TRIGGER 1: Service '$SERVICE_DOWN' tidak active (state=$state_now)"
+    fi
+    if [ -n "$BADVPN_MISSING" ]; then
+        log_msg "TRIGGER 2: badvpn-udpgw process missing"
+    fi
+    log_msg "ACTION: Memanggil $RESTART_CMD..."
+    "$RESTART_CMD" >> "$LOG_FILE" 2>&1
+    rc=$?
+    log_msg "DONE: $RESTART_CMD exit code=$rc"
+    log_msg "=== END EVENT ==="
+    exit 0
+fi
+
+# Saat sehat: silent (TIDAK log apa-apa, exit 0)
+exit 0
