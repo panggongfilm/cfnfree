@@ -6,8 +6,7 @@
 # Tagline : DEKENG ANE BIAK BELITONG
 # Lokasi  : /usr/bin/auto-restart (lokasi BELITONG #14 NEW v43)
 # Source  : Original HAXOR wrapper — reconstruct dari v22-Sesi-2.7-Auto-Restart
-#           (worklog PART-2), design awal v22 untuk VPS lama, sekarang install
-#           di VPS production 116.212.72.178
+#           (worklog PART-2), design awal v22 untuk VPS lama
 # ----------------------------------------------------------------------------
 # Fungsi  : Cron watcher untuk auto-restart service tunneling saat down/crash
 # Trigger : 2 condition (salah satu terpenuhi = restart service tunneling):
