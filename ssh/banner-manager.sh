@@ -7,7 +7,7 @@
 # Tagline : DEKENG ANE BIAK BELITONG
 # Source  : Original HAXOR wrapper — interactive banner manager
 #           ANSI-C + 3 layer safety pattern (adaptasi dari upgrade-dropbear.sh v1.0)
-# Lokasi  : /usr/bin/banner-manager (lokasi BELITONG #13 NEW v41)
+# Lokasi  : /usr/bin/banner-manager
 # Function: Interactive banner manager untuk /etc/issue.net
 #           4 opsi: tampilkan + edit + template + reset
 #           Banner langsung aktif untuk koneksi baru (NO restart service —
