@@ -5,7 +5,7 @@
 # Project : HAXOR cfnfree (panggongfilm/cfnfree fork)
 # Branding: HAXOR PANEL TUNNELING
 # Tagline : DEKENG ANE BIAK BELITONG
-# Source  : Original HAXOR wrapper — Pattern 2 run-once + Pattern 5 palette
+# Source  : Original HAXOR wrapper — interactive banner manager
 #           ANSI-C + 3 layer safety pattern (adaptasi dari upgrade-dropbear.sh v1.0)
 # Lokasi  : /usr/bin/banner-manager (lokasi BELITONG #13 NEW v41)
 # Function: Interactive banner manager untuk /etc/issue.net
@@ -79,7 +79,7 @@ check_root() {
 }
 
 check_command() {
-    # Pattern 6 — validasi command tersedia
+    # Validasi command tersedia
     local missing=0
     for cmd in cat cp mv rm date mkdir ls wc grep printf; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
@@ -524,7 +524,7 @@ main() {
             ;;
     esac
 
-    # Re-entrant while-loop (Pattern 3 v9 — anti stack overflow)
+    # Re-entrant while-loop (anti stack overflow)
     while true; do
         show_menu
         echo -e "${YELLOW}Pilih opsi [01-05 / 0X untuk keluar]: ${NC}"
