@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================================
 # Script  : auto-restart
-# Version : 1.0 (Sesi 2.9 - v43: Auto-restart install untuk VPS production)
+# Version : 1.0 (Auto-restart cron watcher untuk service tunneling)
 # HAXOR PANEL TUNNELING
 # Tagline : DEKENG ANE BIAK BELITONG
 # Lokasi  : /usr/bin/auto-restart (lokasi BELITONG #14 NEW v43)
