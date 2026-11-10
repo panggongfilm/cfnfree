@@ -27,10 +27,10 @@
 #   - iptables -t mangle OUTPUT -m owner --uid-owner <UID> -j MARK --set-mark <idx>
 #   - tc HTB root di eth0 (shape upload) + tc HTB root di lo (shape download)
 #   - tc fw classifier: handle <idx> fw flowid <MAJOR>:<idx>
-#   - Blacklist manual by admin (P3=C v26 retained)
-#   - Hard cap (P2=B v26 retained): rate=ceil, no burst
+#   - Blacklist manual by admin
+#   - Hard cap: rate=ceil, no burst
 # ============================================================
-# KOMITMEN ETIS USER v21+v24 (WAJIB dipertahankan):
+# KOMITMEN ETIS USER (WAJIB dipertahankan):
 #   - Throttle HANYA untuk user blacklist manual by admin
 #   - BUKAN auto-kick, BUKAN throttle semua user
 #   - User normal tetap full speed (default class 1Gbit)
@@ -1117,10 +1117,10 @@ ${CYAN}OPTIONS:${NC}
   --version               Tampilkan versi
 
 ${CYAN}EXAMPLES:${NC}
-  bw-limit --add nyunya 5        # Limit nyunya ke 5 Mbps (hard cap + dynamic rule)
+  bw-limit --add user1 5         # Limit user1 ke 5 Mbps (hard cap + dynamic rule)
   bw-limit --add anti 3          # Limit anti ke 3 Mbps
   bw-limit --list                # Lihat semua user di blacklist
-  bw-limit --remove nyunya       # Hapus limit untuk nyunya
+  bw-limit --remove user1        # Hapus limit untuk user1
   bw-limit --show                # Audit detail status (termasuk dynamic rules)
   bw-limit --watch               # Manual trigger cron watcher
   bw-limit --init                # Rebuild dari blacklist (boot time)
@@ -1168,7 +1168,7 @@ ${CYAN}STATE FILE (NEW v2.1):${NC}
   Format: <user>:<pid>:<ephemeral_port>:<sport>:<mark>
   Contoh:
     anti:326148:10548:109:1
-    nyunya:401181:52252:109:2
+    user1:401181:52252:109:2
   Path: ${STATE_FILE}
 
 ${CYAN}FORCE RECONNECT (NEW v2.1, PATTERN 38):${NC}
