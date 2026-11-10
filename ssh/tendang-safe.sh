@@ -7,7 +7,7 @@
 #           Mode 2: Kill PID per-User (Dropbear child) - untuk Cloudfront/WS-TLS
 #           NO restart service (anti pattern tendang.sh DESTRUCTIVE)
 # Source  : Original HAXOR wrapper
-#           - Pattern 1 jembatan 13D (ss -K dst <ip>) untuk Mode 1
+# - Mode 1: ss -K dst <ip> (kernel-level close socket)
 #           - Pattern 19 v13 (auth.log PID matching) untuk resolve user
 # Brand   : HAXOR + Tagline "DEKENG ANE BIAK BELITONG"
 # Usage   : tendang-safe                    (interactive menu, recommended)
@@ -70,7 +70,7 @@ detect_vps_ip() {
     local ip
     ip=$(ip -4 addr show scope global 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
     [ -z "$ip" ] && ip=$(hostname -I 2>/dev/null | awk '{print $1}')
-    [ -z "$ip" ] && ip="203.194.112.128"  # Fallback hardcode (info dari jembatan 14A)
+    [ -z "$ip" ] && ip="$(hostname -I | awk '{print $1}')"  # Fallback auto-detect via hostname
     echo "$ip"
 }
 VPS_IP=$(detect_vps_ip)
@@ -383,7 +383,7 @@ cmd_kick() {
         return 1
     fi
 
-    # Execute ss -K dst <IP> (Pattern 1 jembatan 13D)
+    # Execute ss -K dst <IP> (kernel-level close socket)
     echo
     echo -e "${CYAN}Menjalankan: ss -K dst $target_ip${NC}"
     local result
@@ -744,10 +744,10 @@ cmd_help() {
     echo -e "${CYAN}Method:${NC}"
     echo "  Mode 1: ss -K dst <IP>  (kernel-level, targeted per-IP)"
     echo "  Mode 2: kill -TERM <PID>  (Dropbear child, graceful)"
-    echo "  Pattern 1 jembatan 13D - anti tendang.sh DESTRUCTIVE (NO restart service)"
+    echo "  Kernel-level close socket - anti tendang.sh DESTRUCTIVE (NO restart service)"
     echo
     echo -e "${CYAN}Source:${NC}"
-    echo "  Original HAXOR wrapper - Pattern 1 jembatan 13D (ss -K dst <ip>)"
+    echo "  Original HAXOR wrapper - ss -K dst <ip> (kernel-level close socket)"
     echo "  Adaptasi resolve_user dari pantau.sh v13 (Pattern 19: auth.log PID matching)"
     echo
 }
