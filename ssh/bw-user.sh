@@ -97,7 +97,7 @@ detect_vps_ip() {
     local ip
     ip=$(ip -4 addr show scope global 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
     [ -z "$ip" ] && ip=$(hostname -I 2>/dev/null | awk '{print $1}')
-    [ -z "$ip" ] && ip="203.194.112.128"  # Fallback hardcode (info dari jembatan 16A)
+    [ -z "$ip" ] && ip="$(hostname -I | awk '{print $1}')"  # Fallback auto-detect via hostname
     echo "$ip"
 }
 
