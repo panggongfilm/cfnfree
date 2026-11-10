@@ -6,7 +6,7 @@
 # Tagline : DEKENG ANE BIAK BELITONG
 # Lokasi  : /usr/bin/auto-restart (lokasi BELITONG #14 NEW v43)
 # Source  : Original HAXOR wrapper — reconstruct dari v22-Sesi-2.7-Auto-Restart
-#           (worklog PART-2), design awal v22 untuk VPS lama
+#           # Source  : Original HAXOR wrapper — cron watcher untuk service tunneling
 # ----------------------------------------------------------------------------
 # Fungsi  : Cron watcher untuk auto-restart service tunneling saat down/crash
 # Trigger : 2 condition (salah satu terpenuhi = restart service tunneling):
@@ -15,7 +15,7 @@
 #           2. pgrep -x badvpn-udpgw kosong (process crash/hilang)
 # Method  : Panggil /usr/bin/sslh-fix-reboot (sama seperti menu no.02 manual)
 #           sslh-fix-reboot TIDAK reboot VPS, hanya restart service tunneling
-#           (verified v38 — 5 marker empirical proof: uptime kontinu + SSH
+#           (verified — 5 marker empirical proof: uptime kontinu + SSH
 #           admin tetap connect + no admin reconnect + no system boot entry
 #           + service restart berhasil)
 # Cron    : */10 * * * * root flock -n /tmp/auto-restart.lock
@@ -25,13 +25,13 @@
 #           interval 10 menit = match VPS 2 core capacity (PATTERN 34)
 # Log     : /var/log/auto-restart.log (hanya berisi event restart,
 #           silent saat sehat — no log entry)
-# Etika   : Auto-restart BOLEH untuk service down (komitmen user v21-v42)
+# Etika   : Auto-restart BOLEH untuk service down (komitmen user)
 #           BUKAN tendang/throttle user heavy bandwidth (pindahkan ke server lain)
 #           TIDAK ada auto-kick untuk user heavy bandwidth
-# Note v42: auto-restart panggil sslh-fix-reboot yang TIDAK menyentuh badvpn.
-#           Kalau SCREEN anomali muncul lagi (LESSON 76 v42 — SCREEN parent
+# Note    : auto-restart panggil sslh-fix-reboot yang TIDAK menyentuh badvpn.
+#           #           Kalau SCREEN anomali muncul lagi (SCREEN parent
 #           process CPU > 10%), auto-restart TIDAK akan solve. Perlu design
-#           script baru untuk auto-handle SCREEN anomali (kandidat v44+ kalau
+#           script baru untuk auto-handle SCREEN anomali (kalau
 #           user mau) — script baru akan: killall badvpn-udpgw + /etc/rc.local
 # ============================================================================
 
