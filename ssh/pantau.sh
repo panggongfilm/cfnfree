@@ -67,7 +67,7 @@ pause() {
 # Ambil daftar koneksi SSH/Dropbear aktif
 # Format output: PID|PEER_IP|LOCAL_PORT|SERVICE
 #
-# FIX1 (v12-Sesi-2.3): Rewrite pure bash + regex, BUKAN awk.
+# FIX1: Rewrite pure bash + regex, BUKAN awk.
 # Alasan: awk match() 3-arg (gawk extension) TIDAK support di mawk
 # (Ubuntu default). Field position awk juga rentan off-by-one
 # kalau ss output punya format berbeda (State column, dsb).
@@ -86,7 +86,7 @@ get_active_connections() {
         fi
 
         # Extract all tokens containing ':' but NOT starting with 'users:' or 'pid='
-        # Tokens valid: '203.194.112.128:22' (IPv4), '[::ffff:203.194.112.128]:22' (IPv6)
+        # Tokens valid: '<VPS_IP>:22' (IPv4), '[::ffff:<VPS_IP>]:22' (IPv6)
         # Tokens invalid: 'users:((', 'pid=12345'
         local addr_list
         addr_list=$(printf '%s\n' "$line" | awk '{
@@ -131,7 +131,7 @@ get_active_connections() {
 # Function resolve_user_from_pid()
 # Dapatkan username LOGIN yang sebenarnya dari PID koneksi SSH/Dropbear.
 #
-# FIX3-A REVISED (v13-Sesi-2.3-FIX3): Hybrid 4-layer resolver.
+# FIX3-A REVISED: Hybrid 4-layer resolver.
 #
 # PELAJARAN FIX3-A REVISI (kritis):
 #   Investigasi VPS aktual (output command #2 dari user) menunjukkan bahwa
@@ -154,7 +154,7 @@ get_active_connections() {
 #   - Bisa pakai journalctl --since "24 hours ago" atau grep /var/log/auth.log
 #   - Robust untuk Dropbear-via-WebSocket (TIDAK tergantung loginuid/PAM)
 #
-# FIX2 (v12-Sesi-2.3): Pertahankan ps -o args= + proc status sebagai fallback akhir.
+# FIX2: Pertahankan ps -o args= + proc status sebagai fallback akhir.
 # ==========================================
 resolve_user_from_pid() {
     local pid="$1"
@@ -676,7 +676,7 @@ feat6_tendang_aman() {
 
 # ==========================================
 # FITUR 5: User Activity Dashboard (Active + Recent Disconnects)
-# FITUR 05 REWORKED (v13-Sesi-2.3-FIX3):
+# FITUR 05 REWORKED:
 #   Logika baru sesuai user request (v13):
 #     1. User AKTIF sekarang (via ss) → TETAP tampil walau login >1 jam lalu.
 #     2. User OFFLINE tapi last login <= 1 jam → tampil (recent disconnect).
